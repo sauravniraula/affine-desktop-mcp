@@ -3,6 +3,7 @@
 import os
 import json
 from pathlib import Path
+import platform as host_platform
 import shutil
 import subprocess
 import tomllib
@@ -66,6 +67,13 @@ class BinaryWheel(bdist_wheel):
 
     def get_tag(self):
         _, _, platform = super().get_tag()
+        if platform.startswith("macosx_") and platform.endswith("_universal2"):
+            # Python may be universal2, but our Rust builds are native and
+            # contain only one architecture. Never advertise both slices.
+            machine = host_platform.machine()
+            if machine not in ("arm64", "x86_64"):
+                raise ValueError(f"Unsupported native macOS architecture: {machine}")
+            platform = platform.removesuffix("universal2") + machine
         # The launcher works across Python versions and the Rust executable has
         # no CPython ABI dependency. Never label a native wheel as "any".
         return "py3", "none", platform

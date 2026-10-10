@@ -33,7 +33,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - run: python -m pip install packaging
+      - run: python -m pip install packaging 'setuptools>=77' wheel
       - name: Test release helpers
         run: python -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - name: Check tag, manifest and existing releases

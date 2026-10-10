@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - run: python -m pip install build
+      - run: python -m pip install build 'setuptools>=77' wheel
       - run: npm test
       - name: Test release helpers
         if: runner.os == 'Linux'
