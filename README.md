@@ -1,4 +1,4 @@
-# AFFiNE Desktop local MCP bridge
+# AFFiNE Desktop MCP
 
 A **Rust stdio MCP server for AFFiNE Desktop offline/local-only workspaces**.
 It reads the desktop application's local SQLite/Yjs storage, creates normal
@@ -9,6 +9,57 @@ free-floating curves, images and file attachments.
 **No AFFiNE Cloud, Docker/self-hosted AFFiNE server, GraphQL API, cloud login,
 or network listener is used.** Docker is used only as an optional Linux test
 runner during development, not by the application.
+
+Connect your AI assistant to your **local AFFiNE notes and editable canvases**.
+Download a standalone binary, add it to your MCP client, and ask the assistant to
+list, search or read your workspaces. Creating pages and diagrams is an explicit,
+offline-only opt-in.
+
+> The GitHub repository is `affine-desktop-mcp`. The executable and Cargo package
+> are named **`affine-local-mcp`** (`affine-local-mcp.exe` on Windows).
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Install a release](#install-a-release)
+- [Build from source](#build-from-source)
+- [Desktop data directories](#desktop-data-directories)
+- [Configuration options](#configuration-options)
+- [Connect your MCP client](#connect-your-mcp-client)
+- [First conversation](#first-conversation)
+- [Tools and examples](#tools)
+- [Write safety and backups](#write-safety-and-backups)
+- [Troubleshooting](#troubleshooting)
+- [Development and releases](#releases)
+
+## Quick start
+
+1. Install AFFiNE Desktop and create/open a **local-only workspace**. This bridge
+   does not expose AFFiNE Cloud workspaces. The tested storage version is **0.27.4**.
+2. [Download and extract](#install-a-release) the binary for your OS and CPU.
+   Prebuilt binaries need no Rust, Node.js, Python, Docker or cloud API key.
+3. Run the binary with `--version`, then `--check` to discover workspace IDs:
+
+   ```sh
+   /absolute/path/affine-local-mcp --version
+   /absolute/path/affine-local-mcp --check
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   & 'C:\tools\affine-local-mcp.exe' --version
+   & 'C:\tools\affine-local-mcp.exe' --check
+   ```
+
+4. [Configure your client](#connect-your-mcp-client) with the binary's **absolute
+   path**. Keep writes disabled initially. Add a workspace allowlist after
+   discovering the IDs you want to expose.
+5. Restart/reconnect the client's MCP server and ask:
+   **“Use the AFFiNE tools to list my local workspaces, then list their documents.”**
+
+The client launches the server for you. Do **not** launch a separate background
+server, enter a URL, or include `--check` in its MCP launch arguments.
 
 ## Important boundary
 
@@ -28,7 +79,87 @@ runner during development, not by the application.
   schema fields and incomplete Yjs updates fail rather than silently returning
   partial documents.
 
-## Build and run
+## Install a release
+
+Open the [latest release](https://github.com/sauravniraula/affine-desktop-mcp/releases/latest)
+or the [v0.1.0 release](https://github.com/sauravniraula/affine-desktop-mcp/releases/tag/v0.1.0).
+Download **one** archive matching the machine where the MCP client runs, plus
+`SHA256SUMS` if you want to verify its integrity.
+
+| Machine | v0.1.0 archive |
+| --- | --- |
+| macOS, Apple Silicon (M1/M2/M3/M4 and other arm64 Macs) | `affine-local-mcp-0.1.0-macos-arm64.tar.gz` |
+| macOS, Intel | `affine-local-mcp-0.1.0-macos-amd64.tar.gz` |
+| Linux, x86_64 / amd64 | `affine-local-mcp-0.1.0-linux-amd64.tar.gz` |
+| Linux, aarch64 / arm64 | `affine-local-mcp-0.1.0-linux-arm64.tar.gz` |
+| Windows, Intel/AMD x64 | `affine-local-mcp-0.1.0-windows-amd64.zip` |
+| Windows, ARM64 | `affine-local-mcp-0.1.0-windows-arm64.zip` |
+
+Linux downloads require **glibc 2.35 or later**; they are not musl/Alpine binaries.
+Each archive includes the executable, README and Apache 2.0 license.
+
+### macOS and Linux
+
+For example, on an **Apple Silicon Mac**, run these commands in a download folder:
+
+```sh
+curl -fLO https://github.com/sauravniraula/affine-desktop-mcp/releases/download/v0.1.0/affine-local-mcp-0.1.0-macos-arm64.tar.gz
+curl -fLO https://github.com/sauravniraula/affine-desktop-mcp/releases/download/v0.1.0/SHA256SUMS
+shasum -a 256 affine-local-mcp-0.1.0-macos-arm64.tar.gz
+```
+
+Compare the printed hash with the line for that archive in `SHA256SUMS` **before
+extracting it**. On Linux you can use `sha256sum` instead of `shasum -a 256`.
+For another OS/CPU, substitute the filename from the table in both the URL and
+the commands.
+
+```sh
+mkdir -p affine-desktop-mcp-0.1.0
+tar -xzf affine-local-mcp-0.1.0-macos-arm64.tar.gz -C affine-desktop-mcp-0.1.0
+mkdir -p "$HOME/.local/bin"
+install -m 755 affine-desktop-mcp-0.1.0/affine-local-mcp "$HOME/.local/bin/affine-local-mcp"
+"$HOME/.local/bin/affine-local-mcp" --version
+"$HOME/.local/bin/affine-local-mcp" --check
+```
+
+Use the expanded absolute path (for example,
+`/Users/alice/.local/bin/affine-local-mcp`) in client configuration. Adding
+`~/.local/bin` to `PATH` is optional when you use an absolute path.
+If macOS blocks the executable, review its source and checksum, then use the
+system's **Privacy & Security** approval flow; do not disable Gatekeeper globally.
+
+### Windows PowerShell
+
+For example, on an **x64 Windows PC**, run in a download folder:
+
+```powershell
+Invoke-WebRequest 'https://github.com/sauravniraula/affine-desktop-mcp/releases/download/v0.1.0/affine-local-mcp-0.1.0-windows-amd64.zip' -OutFile 'affine-local-mcp-0.1.0-windows-amd64.zip'
+Invoke-WebRequest 'https://github.com/sauravniraula/affine-desktop-mcp/releases/download/v0.1.0/SHA256SUMS' -OutFile 'SHA256SUMS'
+Get-FileHash '.\affine-local-mcp-0.1.0-windows-amd64.zip' -Algorithm SHA256
+Get-Content '.\SHA256SUMS'
+```
+
+Compare the hash against the matching filename (hash letter case is irrelevant),
+then extract the archive to a permanent directory you own:
+
+```powershell
+Expand-Archive '.\affine-local-mcp-0.1.0-windows-amd64.zip' -DestinationPath "$env:USERPROFILE\tools\affine-desktop-mcp-0.1.0"
+& "$env:USERPROFILE\tools\affine-desktop-mcp-0.1.0\affine-local-mcp.exe" --version
+& "$env:USERPROFILE\tools\affine-desktop-mcp-0.1.0\affine-local-mcp.exe" --check
+```
+
+For Windows ARM64, substitute `windows-arm64` in the download and extraction
+commands. In JSON, use an expanded path such as
+`"C:\\Users\\alice\\tools\\affine-desktop-mcp-0.1.0\\affine-local-mcp.exe"`.
+
+### Upgrading
+
+Stop the server in your MCP client before replacing its executable, verify the
+new archive, then reconnect. Keep your data-directory and workspace-allowlist
+settings. Upgrading the bridge does not migrate AFFiNE's database. Review release
+notes and AFFiNE version compatibility before enabling writes again.
+
+## Build from source
 
 Install Rust **1.95 or later** and a C compiler (SQLite is bundled):
 
@@ -38,6 +169,8 @@ Install Rust **1.95 or later** and a C compiler (SQLite is bundled):
 - Linux: a C toolchain such as `build-essential` on Debian/Ubuntu.
 
 ```sh
+git clone https://github.com/sauravniraula/affine-desktop-mcp.git
+cd affine-desktop-mcp
 cargo build --release --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
@@ -108,15 +241,120 @@ For Flatpak, portable, beta, renamed, or custom installations, set
 `AFFINE_DATA_DIR` to the directory **containing `workspaces`**, not to a database
 file. You can also pass `--data-dir PATH`.
 
-## MCP client configuration
+For example, if your database is at
+`/home/alice/.config/AFFiNE/workspaces/local/abc123/storage.db`, set
+`AFFINE_DATA_DIR` to `/home/alice/.config/AFFiNE` and use `abc123` as the workspace ID.
+This same rule applies to custom locations on macOS and Windows.
 
-Use your client's standard **stdio** MCP configuration, replacing the binary path
-with its actual absolute path:
+## Configuration options
+
+The bridge has no separate config file. Configure environment variables and/or
+launch arguments in your MCP client. Use **literal, expanded absolute paths**;
+the binary does not expand `~`, `$HOME` or `%APPDATA%` in supplied paths.
+Your shell may expand them when you run a diagnostic command, but JSON clients
+have different interpolation rules.
+
+### Environment variables
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `AFFINE_DATA_DIR` | [OS-specific directory](#desktop-data-directories) | Directory **containing `workspaces`**, not `storage.db` or the workspace directory itself. |
+| `AFFINE_WORKSPACE_IDS` | Unset: all discovered local workspaces | Comma-separated allowlist of workspace IDs. Whitespace is trimmed. An explicitly empty string exposes **no** workspaces. IDs must contain 1–128 ASCII letters, digits, underscores or hyphens. Discover actual IDs with `--check`; names/titles are not IDs. |
+| `AFFINE_ENABLE_WRITES` | Disabled | Only the exact string `"1"` enables writes; `"0"`, `"true"` and other values do not. AFFiNE must still be completely closed. |
+
+Default discovery also uses `APPDATA` on Windows and `XDG_CONFIG_HOME` on Linux.
+If your client filters environment variables, explicitly set `AFFINE_DATA_DIR`
+instead of relying on inherited shell settings.
+
+### Command-line options
+
+| Option | Behavior |
+| --- | --- |
+| `--data-dir PATH` | Overrides `AFFINE_DATA_DIR` / automatic discovery for this process. Pass the flag and path as **separate** elements in `args`. |
+| `--enable-writes` | Enables writes, even when `AFFINE_ENABLE_WRITES` is `"0"`. Omit this flag for read-only operation. There is no `--disable-writes` flag. |
+| `--check` | Prints detected workspaces, warnings and `writesEnabled` as JSON, then exits. Diagnostic only. |
+| `--version` | Prints the package version, then exits. Diagnostic only. |
+| `--help`, `-h` | Prints usage, then exits. Diagnostic only. |
+| No diagnostic option | Starts the stdio MCP server and waits for requests from its client. |
+
+For a custom data directory, the launch arguments can be:
+
+```json
+["--data-dir", "/absolute/path/to/AFFiNE"]
+```
+
+Neither the bridge nor a desktop client necessarily reads your shell profile or
+an `.env` file. Set values in the client's server configuration explicitly.
+There is no port, URL, API token, cloud login or HTTP/SSE mode to configure.
+
+Here is a **restricted, custom-directory** server entry to merge under a client's
+`mcpServers` object. Replace all three placeholders before using it:
+
+```json
+{
+  "affine-desktop": {
+    "command": "/absolute/path/affine-local-mcp",
+    "args": [],
+    "env": {
+      "AFFINE_DATA_DIR": "/absolute/path/to/AFFiNE",
+      "AFFINE_WORKSPACE_IDS": "actual-workspace-id",
+      "AFFINE_ENABLE_WRITES": "0"
+    }
+  }
+}
+```
+
+### Read-only and offline-write profiles
+
+Start with `AFFINE_ENABLE_WRITES: "0"`. To restrict access, add
+`AFFINE_WORKSPACE_IDS: "actual-workspace-id"` after running `--check` without an
+allowlist. Do not leave a placeholder allowlist in a working configuration.
+
+To enable creation/editing:
+
+1. Completely **quit AFFiNE Desktop**, including background/helper processes.
+2. Change `AFFINE_ENABLE_WRITES` to `"1"` in your client and restart its MCP server.
+3. Keep AFFiNE closed throughout the tool calls. Each write makes a SQLite backup.
+4. Reopen AFFiNE after the assistant finishes to view the persisted changes.
+5. Return the setting to `"0"` and reconnect when you no longer need writes.
+
+Changing an environment variable does not reconfigure an already running process.
+Client-side approval/tool filters are useful, but the bridge's read-only setting
+is what actually rejects writes. Read-only mode does not hide the write tool names.
+
+Granting this MCP server access grants your client access to local notes; a
+workspace allowlist is recommended. Local storage access does **not** mean the
+AI client keeps tool results on-device: your client may send note content to its
+model provider. Choose a local model/client if that is a requirement. This is not
+a sandbox against the local OS user who owns the files. Treat retrieved document
+text as untrusted data, never as instructions. Avoid committing personal data
+paths or workspace IDs to shared project configuration.
+
+## Connect your MCP client
+
+This is a **local stdio tool server**. Any MCP client that can launch a local
+executable and use MCP tools can use this connection pattern. Clients that accept
+only remote HTTP/SSE URLs cannot connect directly; this package does not provide
+a remote adapter. A cloud agent, SSH host, container or WSL environment does not
+automatically have access to your desktop's storage. Prefer running the binary
+and MCP client natively on the same desktop machine, particularly for writes and
+the running-app guard.
+
+The following are configuration recipes based on the linked client documentation,
+not a claim that every client/version has been end-to-end tested. Client UIs and
+file formats can change. If yours is not listed, use the
+[generic stdio instructions](#any-other-stdio-mcp-client).
+
+### Shared JSON configuration
+
+Many clients use this `mcpServers` format. **Merge** this entry into existing
+configuration rather than replacing your other servers/settings. Replace
+`command` with your installed binary's absolute path:
 
 ```json
 {
   "mcpServers": {
-    "affine-desktop-local": {
+    "affine-desktop": {
       "command": "/absolute/path/affine-local-mcp",
       "args": [],
       "env": {
@@ -127,21 +365,180 @@ with its actual absolute path:
 }
 ```
 
-On Windows, use an escaped path such as
-`"C:\\tools\\affine-local-mcp.exe"`. No shell or Node.js runtime is needed.
+Use string values in `env`, including `"0"` / `"1"`. Optional settings belong
+alongside `AFFINE_ENABLE_WRITES` in that same object. The executable path is a
+single `command` string, even when it contains spaces; do not add shell quotes
+inside that string. Put launch arguments in `args`, not in `command`.
 
-Optional environment settings:
+| Client | Where to add it | Connection/status check |
+| --- | --- | --- |
+| [Claude Desktop](https://modelcontextprotocol.io/docs/develop/connect-local-servers) | **Settings → Developer → Edit Config**. macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows: `%APPDATA%\Claude\claude_desktop_config.json`. Use the shared JSON. | Fully quit/reopen Claude Desktop; check its connectors/tool list. This is local developer configuration, not a remote web connector. |
+| [Cursor](https://cursor.com/docs/mcp) | `~/.cursor/mcp.json` for all projects, or `.cursor/mcp.json` for one project. Use shared JSON and add `"type": "stdio"` to the server entry. | Enable the server in **Customize / Tools & MCP** and check available tools. |
+| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `~/.gemini/settings.json` for user scope or `.gemini/settings.json` for a project. Use shared JSON. | Restart Gemini; run `gemini mcp list` in a terminal or `/mcp` in a session. Keep tool confirmations enabled. |
+| [Cline](https://docs.cline.bot/mcp/mcp-overview) | Extension: **MCP Servers → Configure → Configure MCP Servers**. CLI: `~/.cline/data/settings/cline_mcp_settings.json`. Use shared JSON. | Restart the server and verify tools in the MCP panel. Leave `autoApprove` empty/omit it until you review the tools. |
+| [Roo Code](https://docs.roocode.com/features/mcp/using-mcp-in-roo) | **MCP settings → Edit Global MCP**, or `.roo/mcp.json` for a project. Use shared JSON. | Enable/restart the server in the MCP panel; do not blanket-allow mutating tools. |
+| [LM Studio](https://lmstudio.ai/docs/app/plugins/mcp) | **Program → Install → Edit mcp.json**. Merge the shared JSON server entry. | Enable the server for the conversation and use a model that supports tool calling. |
+| [Windsurf / Cascade](https://docs.windsurf.com/windsurf/cascade/mcp) | Open the MCP config from the agent's MCP settings and merge shared JSON. Legacy Windsurf uses `~/.codeium/windsurf/mcp_config.json`. Newer Devin Desktop/Cascade docs use `~/.config/devin/mcp_config.json` (Windows: `%APPDATA%\devin\mcp_config.json`). | Use the file opened by **your installed version's UI**, not an assumed legacy path; enable/restart the server. Devin Local uses the [Devin CLI configuration](https://docs.devin.ai/cli/extensibility/mcp/configuration). |
 
-| Setting | Meaning |
+The clients below have different configuration shapes; do not paste `mcpServers`
+unchanged into their native configuration.
+
+### Claude Code
+
+Register the server for your user (all projects):
+
+```sh
+claude mcp add --transport stdio --scope user --env AFFINE_ENABLE_WRITES=0 affine-desktop -- /absolute/path/affine-local-mcp
+claude mcp list
+```
+
+Use `/mcp` inside Claude Code to inspect the connection. To keep it project-scoped,
+use `--scope local`; to deliberately share configuration, use `--scope project`.
+Add other variables with additional `--env NAME=value` options before `--`.
+Server arguments go after the binary, for example
+`-- /absolute/path/affine-local-mcp --data-dir /absolute/path/to/AFFiNE`.
+See [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+### Codex CLI, IDE extension and desktop clients
+
+Add this TOML to `~/.codex/config.toml`, or `.codex/config.toml` in a trusted project:
+
+```toml
+[mcp_servers.affine-desktop]
+command = "/absolute/path/affine-local-mcp"
+args = []
+
+[mcp_servers.affine-desktop.env]
+AFFINE_ENABLE_WRITES = "0"
+```
+
+For a Windows path, TOML literal strings avoid backslash escaping:
+`command = 'C:\tools\affine-local-mcp.exe'`.
+Reconnect/restart the client and inspect its MCP server list. Codex clients on
+the same host share this configuration; a hosted web-only connector is not a
+local stdio process. See [Codex MCP documentation](https://developers.openai.com/codex/mcp).
+
+### VS Code / GitHub Copilot
+
+For current versions, create a project-root `.mcp.json` using the shared JSON,
+or use **MCP: Add Server → Command (stdio)** and choose a local/user destination.
+The portable user configuration is `~/.copilot/mcp-config.json` (or under
+`COPILOT_HOME` when set).
+
+For VS Code's `.vscode/mcp.json` format, the top-level key is **`servers`**:
+
+```json
+{
+  "servers": {
+    "affine-desktop": {
+      "type": "stdio",
+      "command": "/absolute/path/affine-local-mcp",
+      "args": [],
+      "env": { "AFFINE_ENABLE_WRITES": "0" }
+    }
+  }
+}
+```
+
+Use **MCP: List Servers** to start the server/view logs, then enable its tools in
+an agent chat. With SSH/Dev Containers, choose configuration that runs **locally
+on the desktop host**, not in a remote environment without AFFiNE's files.
+See [VS Code MCP documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers).
+
+### Zed
+
+Use **Settings → AI → MCP Servers → Add Server → Add Local Server**, or merge this
+into the settings file opened by `zed: open settings file`:
+
+```json
+{
+  "context_servers": {
+    "affine-desktop": {
+      "command": "/absolute/path/affine-local-mcp",
+      "args": [],
+      "env": { "AFFINE_ENABLE_WRITES": "0" }
+    }
+  }
+}
+```
+
+Check the server status in MCP settings and use its tools in Zed Agent. External
+agents/terminal threads may read their own native client configuration instead.
+See [Zed MCP documentation](https://zed.dev/docs/ai/mcp).
+
+### OpenCode
+
+Merge into `opencode.json` in your project or
+`~/.config/opencode/opencode.json` for user-wide access:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "affine-desktop": {
+      "type": "local",
+      "command": ["/absolute/path/affine-local-mcp"],
+      "environment": { "AFFINE_ENABLE_WRITES": "0" },
+      "enabled": true
+    }
+  }
+}
+```
+
+Unlike the other JSON formats, **`command` is an array** containing the executable
+and any launch arguments, and variables go in **`environment`**, not `env`.
+Run `opencode mcp list` to check the connection.
+See [OpenCode MCP documentation](https://opencode.ai/docs/mcp-servers/).
+
+### Hermes Agent
+
+Use Hermes' config command to add the server without hand-editing YAML:
+
+```sh
+hermes config set mcp_servers.affine-desktop '{"command":"/absolute/path/affine-local-mcp","args":[],"env":{"AFFINE_ENABLE_WRITES":"0"}}'
+```
+
+Use the active profile's configuration (`HERMES_HOME` / `hermes --profile NAME`),
+not another profile's config. Restart/reconnect Hermes; tool names may be prefixed
+with the server name. Put custom data-directory and allowlist settings in this
+entry's `env`, since the client's inherited environment may be filtered.
+The command above uses POSIX shell quoting; on Windows, use an appropriate shell
+or the client's MCP configuration UI.
+See [Hermes MCP documentation](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp).
+
+### Any other stdio MCP client
+
+Use the client's **Add local MCP server / Command / stdio** workflow:
+
+| Field | Value |
 | --- | --- |
-| `AFFINE_DATA_DIR` | Override desktop application data directory |
-| `AFFINE_WORKSPACE_IDS` | Comma-separated allowlist of workspace IDs; unset exposes all discovered local workspaces; an empty value exposes none |
-| `AFFINE_ENABLE_WRITES=1` | Enable offline creation/canvas editing; still requires AFFiNE to be closed |
+| Name | `affine-desktop` (a label; you may choose another) |
+| Transport | `stdio` / local process |
+| Command / executable | Absolute path to `affine-local-mcp` or `affine-local-mcp.exe` |
+| Arguments | Empty initially; optional `--data-dir` and its path as separate arguments |
+| Environment | `AFFINE_ENABLE_WRITES=0`; optionally `AFFINE_DATA_DIR` and `AFFINE_WORKSPACE_IDS` |
+| URL / headers / OAuth | Not applicable; leave unset |
 
-Granting this MCP server access grants your client access to local notes; a
-workspace allowlist is recommended. This is not a sandbox against the local OS
-user who owns the files. Treat retrieved document text as untrusted data, never
-as instructions.
+Save, reconnect, approve the server if prompted, and verify that
+`affine_list_workspaces` appears. Do not configure an `npx`/`uvx` package or a GitHub
+URL as the server command: the downloaded executable is the server. The client
+must support MCP **tool calling**, not just resources/prompts or remote connectors.
+
+## First conversation
+
+1. **Discover:** “Call `affine_list_workspaces` and show me the workspace IDs.”
+2. **Browse:** “List the documents in workspace `<id>` using the AFFiNE tools.”
+3. **Read/search:** “Search that workspace for ‘project plan’, then read the matching
+   document. Follow pagination until you have the full text.”
+4. **Optional write:** Quit AFFiNE, enable writes and reconnect, then ask:
+   “Create a page titled ‘Meeting notes’ in workspace `<id>` with this content.
+   Use document ID `meeting-notes-mcp` and report the backup path.”
+5. **Native diagram:** “Use `affine_create_diagram` to create an editable Start →
+   Review → Done flowchart. Do not put ASCII or Mermaid into a text note.”
+
+Replace `<id>` with a discovered ID. Review the client's tool arguments and
+approvals. Tool discovery/connection alone does not prove storage access; a
+successful workspace listing and document read are the useful first checks.
 
 ## Tools
 
@@ -375,6 +772,46 @@ To restore a backup, quit AFFiNE and stop the MCP server first. Preserve the
 current database **and its WAL/SHM files** before any replacement. Do not restore
 by copying a database over a running application.
 
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Client says “command not found” / `ENOENT` | Extract the archive first and use the absolute executable path, not the archive, directory, GitHub URL or Cargo package name. GUI clients may have a different `PATH` from your shell. On Windows include `.exe` and escape JSON backslashes. |
+| “Permission denied” or macOS blocks launch | Ensure the file is executable (`chmod +x /absolute/path/affine-local-mcp` on macOS/Linux). Review macOS Privacy & Security prompts and the download checksum. Do not bypass security globally. |
+| “Exec format error” / wrong architecture / missing glibc | Choose the OS/CPU archive from the installation table. Linux binaries need glibc 2.35+; build from source for other supported environments. |
+| Running the binary appears to hang | Without a diagnostic flag it is waiting for MCP requests on stdin. This is normal; let your client launch it. Use `--check` for a standalone diagnostic. |
+| Server exits immediately or tools never appear | Remove `--check`, `--help` and `--version` from MCP `args`. Confirm stdio transport, the correct client config shape, and that the client enabled/trusted the server. Read its MCP stderr logs. |
+| “No local workspaces” | Open/create a local-only workspace in AFFiNE and let it persist. Run `--check`. For a custom install, point `AFFINE_DATA_DIR` / `--data-dir` at the directory containing `workspaces`. Cloud caches are deliberately excluded. |
+| Workspace missing or “Unknown or disallowed local workspace” | Check `AFFINE_WORKSPACE_IDS`. An empty value exposes none; a name instead of an ID will not match. Discover IDs without an allowlist, then reconnect with the intended IDs. |
+| Listing succeeds but documents have warnings | Check persisted data, schema compatibility and AFFiNE version. Inspect `warnings` / `partial`; do not treat partial search results as a complete export. |
+| “Writes disabled” | Keep read-only mode unless you need a mutation. For writes, quit AFFiNE, set `AFFINE_ENABLE_WRITES` to the string `"1"` and restart the client's server. |
+| “Quit AFFiNE Desktop before writing” | Closing its window may not quit background processes. Completely quit it and keep it closed throughout the operation. Do not defeat the process guard. |
+| Edits are not visible in AFFiNE | Finish all offline writes, then reopen AFFiNE. There is no live editor synchronization; readers also see only persisted content. |
+| “Unsupported storage schema” / “Incomplete Yjs data” | Do not edit SQLite manually or force a migration. Let AFFiNE finish persisting, check the tested 0.27.4 contract, and report the exact error without sharing private notes/databases. |
+| Media path rejected | Copy the file into `<AFFINE_DATA_DIR>/mcp-imports`. Arbitrary filesystem paths, URL imports, escaping symlinks and files above the documented limits are not accepted. |
+
+For a custom location, diagnose with the **same path and environment** used by the
+client. Example (macOS/Linux):
+
+```sh
+AFFINE_ENABLE_WRITES=0 /absolute/path/affine-local-mcp --data-dir /absolute/path/to/AFFiNE --check
+```
+
+Windows PowerShell:
+
+```powershell
+$env:AFFINE_ENABLE_WRITES = '0'
+& 'C:\tools\affine-local-mcp.exe' --data-dir 'C:\Users\alice\AppData\Roaming\AFFiNE' --check
+```
+
+Restart/reconnect the client after any config change. If a command works in your
+terminal but not in the client, compare executable paths, environment variables,
+permissions and whether the client runs locally or remotely. Consult the client's
+MCP logs, not stdout logging wrappers: stdout must contain only MCP messages.
+When [reporting an issue](https://github.com/sauravniraula/affine-desktop-mcp/issues),
+include OS/architecture, bridge `--version`, AFFiNE version, client/version and a
+redacted error/config. Do not upload workspace databases or private tool results.
+
 ## Verification
 
 `cargo test`'s write integration test uses the production running-app guard;
@@ -399,6 +836,10 @@ shared-blob preservation, import-root/symlink containment, and combined
 canvas/blob rollback through actual MCP stdio calls.
 These are storage/MCP tests, not a desktop screenshot or visual-rendering test.
 
-The GitHub Actions matrix runs tests, formatting, Clippy and release builds on
-macOS, Windows and Linux. Adding this workflow does not mean it has run; local
-execution results must be reported separately.
+The [GitHub Actions matrix](https://github.com/sauravniraula/affine-desktop-mcp/actions)
+runs tests, formatting, Clippy and release builds on macOS, Windows and Linux.
+The release workflow additionally tests/builds all six OS/architecture targets
+before publishing. Client-specific configuration recipes above are documentation,
+not an end-to-end certification of every client UI or model. Release archives
+contain the README from their tagged commit; this repository's default branch
+contains the latest setup guidance.
