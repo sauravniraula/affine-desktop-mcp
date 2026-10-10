@@ -1,6 +1,6 @@
 [package]
 name = "affine-desktop-mcp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Local MCP bridge for AFFiNE Desktop with offline native diagrams"
 rust-version = "1.95"
