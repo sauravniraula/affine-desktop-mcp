@@ -15,13 +15,17 @@ Download a standalone binary, add it to your MCP client, and ask the assistant t
 list, search or read your workspaces. Creating pages and diagrams is an explicit,
 offline-only opt-in.
 
-> The GitHub repository is `affine-desktop-mcp`. The executable and Cargo package
-> are named **`affine-local-mcp`** (`affine-local-mcp.exe` on Windows).
+> The Cargo, npm and Python packages are all **`affine-desktop-mcp`**.
+> The npm and Python launcher command is also **`affine-desktop-mcp`**.
+> The standalone executable (including Cargo installs) remains **`affine-local-mcp`**
+> (`affine-local-mcp.exe` on Windows). Registry packages are prepared here but
+> have **not yet been published**; registry install commands below apply after release.
 
 ## Contents
 
 - [Quick start](#quick-start)
 - [Install a release](#install-a-release)
+- [Install with npm or pip](#install-with-npm-or-pip)
 - [Build from source](#build-from-source)
 - [Desktop data directories](#desktop-data-directories)
 - [Configuration options](#configuration-options)
@@ -159,6 +163,94 @@ new archive, then reconnect. Keep your data-directory and workspace-allowlist
 settings. Upgrading the bridge does not migrate AFFiNE's database. Review release
 notes and AFFiNE version compatibility before enabling writes again.
 
+## Install with npm or pip
+
+**These packages have not yet been published.** The following registry commands
+will work after publication. Both packages bundle the same native Rust server;
+they do not reimplement it or enable writes. Installation uses the package
+registry, but the installed server runs offline and never downloads a binary at
+startup. macOS, glibc Linux and Windows are supported on x64 and arm64.
+
+### npm / npx
+
+Requires Node.js **18 or later**. npm automatically installs the matching native
+optional dependency; do not use `--omit=optional`.
+
+```sh
+npm install -g affine-desktop-mcp
+affine-desktop-mcp --version
+affine-desktop-mcp --check
+```
+
+Or run without a global installation:
+
+```sh
+npx --yes affine-desktop-mcp --check
+```
+
+For a stdio MCP client, use `"command": "npx"` and
+`"args": ["--yes", "affine-desktop-mcp"]`. On Windows use `npx.cmd` if your
+client requires the command shim. For reproducibility, pin the package in args
+to a published version, for example `affine-desktop-mcp@0.2.0`. GUI clients may
+need the absolute path to `npx` or the installed launcher.
+
+### pip / pipx / uvx
+
+Requires Python **3.11 or later**. Use a virtual environment with pip, or use
+pipx/uvx for an isolated CLI installation. Supported-platform wheels require no
+Rust compiler; a source installation needs the [Rust/C build tools](#build-from-source).
+Linux release wheels require glibc 2.35 or later (not Alpine/musl).
+
+```sh
+python -m venv .venv
+# macOS/Linux: source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install affine-desktop-mcp
+affine-desktop-mcp --version
+affine-desktop-mcp --check
+```
+
+Alternatively:
+
+```sh
+pipx install affine-desktop-mcp
+# Or run without a persistent installation:
+uvx affine-desktop-mcp --check
+```
+
+Use the installed launcher's absolute path as your MCP client's `command`, with
+empty `args`, or use `"command": "uvx"`, `"args": ["affine-desktop-mcp"]`.
+Pin a published version with `affine-desktop-mcp==0.2.0` in uvx's args.
+`python -m affine_desktop_mcp` is also supported. Do not put diagnostic flags
+such as `--check` into the client's launch arguments. The configuration variables,
+allowlists and offline-write safety rules below apply to both launchers unchanged.
+
+### Local packages before publication
+
+From a checkout, build a source installation with
+`python -m pip install .` in a virtual environment (Rust and a C compiler required).
+To build installable release artifacts for the current machine:
+
+```sh
+python -m pip install build
+cargo build --release --locked
+# Apple Silicon example; use linux/windows and amd64/arm64 for your machine.
+# On Windows the binary ends in .exe.
+python .github/scripts/package_registries.py --binary target/release/affine-local-mcp --platform macos --arch arm64
+python .github/scripts/package_registries.py --shared
+python .github/scripts/smoke_packages.py --platform macos --arch arm64
+```
+
+Artifacts are written to `dist/`. The smoke test installs the main npm tarball
+**and** its matching native tarball together, installs the wheel in a fresh
+virtual environment, and exercises actual MCP stdio calls against an isolated
+empty data directory. It does not read or write your real notes. Installing just
+the wheel needs no compiler; add `--source` to the smoke command to also verify a
+source-archive installation using Rust. Installing just
+the npm wrapper from this unpublished checkout cannot fetch unpublished native
+dependencies. Local Linux wheels have a `linux_*` tag; the release workflow audits
+and repairs them to `manylinux_*` before they can be uploaded to PyPI.
+
 ## Build from source
 
 Install Rust **1.95 or later** and a C compiler (SQLite is bundled):
@@ -209,9 +301,13 @@ The release also includes `SHA256SUMS` for verifying downloads.
 Linux binaries are built on Ubuntu 22.04 and require glibc 2.35 or later.
 
 To release, set `[package].version` in `Cargo.toml`, update `Cargo.lock` with
-`cargo check`, commit the changes, then push a matching tag such as `v0.1.0`.
-Unprefixed tags such as `0.1.0` are also accepted. The tag's version must match
-the manifest exactly, including any prerelease/build suffix.
+`cargo check`, and set the same version in `package.json` and all six of its
+`optionalDependencies`. Python metadata derives its version from Cargo (Python
+prerelease spelling is normalized by setuptools). Commit the changes, then push
+a matching **new** tag such as `v0.2.0`; existing releases are not replaced.
+Only pushes of tags matching `v*` trigger the release workflow; unprefixed tags
+such as `0.1.0` do not. The version after `v` must match the manifest exactly,
+including any prerelease/build suffix.
 
 Before any build, the workflow skips publication if the tag does not match
 the manifest or a release already exists for that version (with or without
@@ -219,6 +315,85 @@ the `v` prefix, including drafts and prereleases). GitHub API errors fail the
 check rather than being treated as permission to release. Publication runs
 only after all six builds and tests succeed, and checks for an existing release
 again before uploading. Prerelease versions are marked as GitHub prereleases.
+
+The workflow also builds/tests six native npm tarballs and six platform-specific
+Python wheels, plus the main npm tarball and Python source distribution. Linux
+wheels are checked/repaired with auditwheel for manylinux/glibc compatibility.
+These artifacts and `SHA256SUMS` are attached to the GitHub release; **the workflow
+then automatically publishes to crates.io, npm and PyPI** using GitHub Actions
+secrets. A dry-run-verified Cargo `.crate` archive is also attached to the release.
+Registry jobs download these exact assets and verify `SHA256SUMS` before uploading.
+
+### Required GitHub Actions secrets
+
+In this repository, open **Settings → Secrets and variables → Actions → New
+repository secret** and add these exact names. The workflow checks that all three
+exist before starting a new release build. Never paste tokens into issues, chat,
+workflow YAML, or committed configuration files.
+
+| Secret | Value and permissions |
+| --- | --- |
+| `CARGO_REGISTRY_TOKEN` | A [crates.io API token](https://crates.io/settings/tokens) scoped to **`affine-desktop-mcp`**, with **Publish new crates** (`publish-new`) for the first release and **Publish updates to existing crates** (`publish-update`) for later versions. No owner-management or yank permissions are needed. Verify the account's email address and ensure you own/can create the crate name. |
+| `NPM_TOKEN` | An [npm granular access token](https://docs.npmjs.com/creating-and-viewing-access-tokens) with **Read and write (publish and stage)** permissions and **Bypass two-factor authentication** enabled for unattended publishing. For the initial creation of the seven unscoped packages, use a token allowed to create them (typically **All Packages**); afterward restrict it to the seven package names listed below. Do not use a read-only, stage-only or legacy token. Package settings must permit token publishing. |
+| `PYPI_API_TOKEN` | A production [PyPI API token](https://pypi.org/manage/account/token/), including its `pypi-` prefix. For the first release, use an account-wide token so it can create **`affine-desktop-mcp`**. After creation, replace it with a token scoped only to that project. Verify your email and complete PyPI's account/2FA requirements. A TestPyPI token will not work. The workflow supplies username `__token__` automatically. |
+
+The npm token must cover all of:
+
+- `affine-desktop-mcp`
+- `affine-desktop-mcp-darwin-x64`
+- `affine-desktop-mcp-darwin-arm64`
+- `affine-desktop-mcp-linux-x64`
+- `affine-desktop-mcp-linux-arm64`
+- `affine-desktop-mcp-win32-x64`
+- `affine-desktop-mcp-win32-arm64`
+
+All package names must be available to or owned by your registry accounts.
+Creating local manifests does not reserve names. Choose short-lived tokens and
+rotate/update the corresponding GitHub secret before expiration. Standard GitHub
+hosted runners do not have fixed outbound IPs; do not apply an incompatible token
+IP allowlist.
+
+**No custom GitHub PAT, SSH key, signing key, or registry username secret is
+required.** GitHub supplies `GITHUB_TOKEN` automatically; the GitHub-release job
+declares `contents: write`, while registry jobs use read-only GitHub permissions.
+Allow Actions to run in repository settings and ensure organization policies do
+not block that permission. The standalone binaries remain unsigned; Apple
+notarization and Windows Authenticode signing are not part of this workflow.
+
+### Publication and recovery
+
+After committing the packaging/workflow changes, set a new matching version in
+Cargo and npm metadata and push its `v...` tag. Existing GitHub releases are not
+overwritten or automatically backfilled. Monitor **Actions → Release**:
+
+1. Validate the tag/manifests and required secrets.
+2. Build/test all six native targets, install/test their packages and audit Linux wheels.
+3. Dry-run the Cargo publication, create the GitHub release and verify its assets.
+4. Independently publish `affine-desktop-mcp` to crates.io, all seven npm packages,
+   and all six Python wheels plus the source distribution to PyPI.
+
+Stable npm versions use `latest`; prereleases use `next` on all seven packages.
+Python prerelease versions use normalized PEP 440 spelling. Registry jobs read
+back public registry metadata and compare uploaded checksums. Existing identical
+files are safely skipped; conflicting or yanked files fail rather than being
+overwritten. Native npm dependencies are published and verified before the main
+launcher. Tokens are passed only to secret preflight and the corresponding
+publication step, not to build/test jobs.
+
+Publication across independent registries is **not atomic**: the GitHub release
+or some registry packages may remain if another registry fails. Fix the cause
+(for example an expired token) and select **Re-run failed jobs**, not all jobs.
+Alternatively, use **Actions → Release → Run workflow**, select the default branch
+containing this workflow, and supply the existing release tag in the `tag` field.
+This recovery mode checks out that exact tag, downloads its original release
+assets, verifies checksums and resumes registry publication **without rebuilding
+binaries or replacing the GitHub release**. It requires an existing published
+release produced by this workflow, not an old binary-only release or a draft.
+
+Once publication succeeds, check fresh registry installs with `cargo install
+affine-desktop-mcp --locked`, `npx --yes affine-desktop-mcp --version` and `uvx
+affine-desktop-mcp --version`. No registry credentials have been added to this
+repository, and editing this workflow alone does not publish anything.
 
 ## License
 
@@ -520,9 +695,10 @@ Use the client's **Add local MCP server / Command / stdio** workflow:
 | URL / headers / OAuth | Not applicable; leave unset |
 
 Save, reconnect, approve the server if prompted, and verify that
-`affine_list_workspaces` appears. Do not configure an `npx`/`uvx` package or a GitHub
-URL as the server command: the downloaded executable is the server. The client
-must support MCP **tool calling**, not just resources/prompts or remote connectors.
+`affine_list_workspaces` appears. For standalone downloads, the extracted
+executable is the command, not a GitHub URL. After registry publication, you can
+also use the [npm/uvx launcher recipes](#install-with-npm-or-pip). The client must
+support MCP **tool calling**, not just resources/prompts or remote connectors.
 
 ## First conversation
 

@@ -1,0 +1,31 @@
+{
+  "name": "affine-desktop-mcp",
+  "version": "0.2.0",
+  "description": "Local stdio MCP bridge for AFFiNE Desktop with offline native diagrams",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sauravniraula/affine-desktop-mcp.git"
+  },
+  "homepage": "https://github.com/sauravniraula/affine-desktop-mcp#readme",
+  "bugs": "https://github.com/sauravniraula/affine-desktop-mcp/issues",
+  "keywords": ["affine", "mcp", "desktop", "notes", "diagrams"],
+  "bin": {
+    "affine-desktop-mcp": "npm/cli.cjs"
+  },
+  "files": ["npm/cli.cjs", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test npm/test/*.test.cjs"
+  },
+  "optionalDependencies": {
+    "affine-desktop-mcp-darwin-x64": "0.2.0",
+    "affine-desktop-mcp-darwin-arm64": "0.2.0",
+    "affine-desktop-mcp-linux-x64": "0.2.0",
+    "affine-desktop-mcp-linux-arm64": "0.2.0",
+    "affine-desktop-mcp-win32-x64": "0.2.0",
+    "affine-desktop-mcp-win32-arm64": "0.2.0"
+  }
+}

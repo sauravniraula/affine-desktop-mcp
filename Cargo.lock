@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "affine-local-mcp"
-version = "0.1.0"
+name = "affine-desktop-mcp"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

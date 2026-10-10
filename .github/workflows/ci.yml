@@ -15,6 +15,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install build
+      - run: npm test
       - name: Test release helpers
         if: runner.os == 'Linux'
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
@@ -26,3 +34,20 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Build and install npm and Python packages
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          case "$RUNNER_OS" in
+            Linux) platform=linux; binary=target/release/affine-local-mcp ;;
+            macOS) platform=macos; binary=target/release/affine-local-mcp ;;
+            Windows) platform=windows; binary=target/release/affine-local-mcp.exe ;;
+          esac
+          arch=amd64
+          if [[ "$RUNNER_ARCH" == "ARM64" ]]; then arch=arm64; fi
+          python .github/scripts/package_registries.py --binary "$binary" --platform "$platform" --arch "$arch"
+          python .github/scripts/package_registries.py --shared
+          source_args=()
+          if [[ "$RUNNER_OS" == "Linux" ]]; then source_args=(--source); fi
+          python .github/scripts/smoke_packages.py --platform "$platform" --arch "$arch" "${source_args[@]}"
