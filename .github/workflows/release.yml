@@ -2,12 +2,18 @@ name: Release
 
 on:
   push:
-    tags: ['*']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to resume registry publication (e.g. v0.2.0)'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# Serialize publications, including equivalent v-prefixed/unprefixed tags.
+# Serialize release publications, including recovery runs.
 concurrency:
   group: release-${{ github.workflow }}
   cancel-in-progress: false
@@ -22,18 +28,33 @@ jobs:
       prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install packaging
       - name: Test release helpers
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+        run: python -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - name: Check tag, manifest and existing releases
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/release_check.py
+          GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+        run: python .github/scripts/release_check.py
+      - name: Require registry publishing secrets
+        if: steps.check.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: python .github/scripts/publish_registries.py --check-secrets --tag "$TAG"
 
   build:
     name: Build ${{ matrix.platform }}-${{ matrix.arch }}
     needs: check
-    if: needs.check.outputs.should_release == 'true'
+    if: github.event_name == 'push' && needs.check.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +87,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,6 +100,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install build
+      - run: npm test
       - name: Test
         run: cargo test --locked --target "$TARGET"
         env:
@@ -107,18 +135,48 @@ jobs:
           python .github/scripts/package_release.py \
             --target "$TARGET" --platform "$PLATFORM" \
             --arch "$ARCH" --version "$VERSION"
+      - name: Package npm native binary and Python wheel
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          binary="target/$TARGET/release/affine-local-mcp"
+          if [[ "$PLATFORM" == "windows" ]]; then binary="${binary}.exe"; fi
+          python .github/scripts/package_registries.py --binary "$binary" --platform "$PLATFORM" --arch "$ARCH"
+          npm pack --ignore-scripts --pack-destination dist
+      - name: Audit and repair Linux wheels for PyPI
+        if: matrix.platform == 'linux'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python -m pip install auditwheel 'patchelf>=0.14.5'
+          wheel_arch=x86_64
+          if [[ "$ARCH" == "arm64" ]]; then wheel_arch=aarch64; fi
+          auditwheel repair --plat "manylinux_2_35_$wheel_arch" --wheel-dir repaired dist/*.whl
+          rm dist/*.whl
+          mv repaired/*.whl dist/
+      - name: Install packages and test real MCP stdio
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: python .github/scripts/smoke_packages.py --platform "$PLATFORM" --arch "$ARCH"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/*
+          path: |
+            dist/*
+            !dist/affine-desktop-mcp-${{ needs.check.outputs.version }}.tgz
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish GitHub release
     needs: [check, build]
-    if: needs.check.outputs.should_release == 'true'
+    if: github.event_name == 'push' && needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.verified.outputs.published }}
     permissions:
       contents: write
     env:
@@ -134,14 +192,45 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.should_release == 'true'
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        if: steps.check.outputs.should_release == 'true'
+        with:
+          python-version: '3.13'
+      - name: Build main npm package and Python source distribution
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          python -m pip install build twine
+          python .github/scripts/package_registries.py --shared
+          twine check dist/*.whl dist/affine_desktop_mcp-*.tar.gz
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.should_release == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.should_release == 'true'
+      - name: Validate and package the Cargo release
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          cargo publish --dry-run --locked --registry crates-io
+          cp "target/package/affine-desktop-mcp-$VERSION.crate" dist/
       - name: Check assets and generate checksums
         if: steps.check.outputs.should_release == 'true'
         working-directory: dist
         run: |
           shopt -s nullglob
           archives=(*.tar.gz *.zip)
-          test "${#archives[@]}" -eq 6
-          sha256sum "${archives[@]}" > SHA256SUMS
+          npm_packages=(*.tgz)
+          wheels=(*.whl)
+          crates=(*.crate)
+          test "${#archives[@]}" -eq 7
+          test "${#npm_packages[@]}" -eq 7
+          test "${#wheels[@]}" -eq 6
+          test "${#crates[@]}" -eq 1
+          sha256sum "${archives[@]}" "${npm_packages[@]}" "${wheels[@]}" "${crates[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
       - name: Create release with all assets
         if: steps.check.outputs.should_release == 'true'
@@ -156,6 +245,7 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"
       - name: Verify published release and assets
+        id: verified
         if: steps.check.outputs.should_release == 'true'
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
@@ -169,6 +259,73 @@ jobs:
           assert release["tagName"] == os.environ["GITHUB_REF_NAME"]
           assert not release["isDraft"]
           assert {asset["name"] for asset in release["assets"]} == expected
-          assert len(expected) == 7
+          assert len(expected) == 22
           print(f"Verified published release with {len(expected)} assets.")
           PY
+          printf 'published=true\n' >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish to ${{ matrix.registry }}
+    needs: [check, release]
+    if: always() && needs.check.result == 'success' && (needs.release.outputs.published == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        registry: [cargo, npm, pypi]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install packaging
+      - uses: actions/setup-node@v4
+        if: matrix.registry == 'npm'
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.registry == 'cargo'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.registry == 'cargo'
+      - run: python -m pip install twine
+        if: matrix.registry == 'pypi'
+      - name: Download the exact published release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft > release.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          release = json.loads(Path("release.json").read_text())
+          assert release["tagName"] == os.environ["TAG"], "Wrong release tag"
+          assert not release["isDraft"], "Draft releases cannot be published to registries"
+          PY
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+      - name: Verify downloaded checksums before publishing
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+      - name: Publish Cargo package and verify crates.io checksum
+        if: matrix.registry == 'cargo'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: python .github/scripts/publish_registries.py --registry cargo --tag "$RELEASE_TAG"
+      - name: Publish native npm packages, then the launcher
+        if: matrix.registry == 'npm'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: python .github/scripts/publish_registries.py --registry npm --tag "$RELEASE_TAG"
+      - name: Publish Python wheels and source distribution
+        if: matrix.registry == 'pypi'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_NON_INTERACTIVE: '1'
+        run: python .github/scripts/publish_registries.py --registry pypi --tag "$RELEASE_TAG"
