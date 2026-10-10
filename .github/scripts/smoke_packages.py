@@ -115,6 +115,11 @@ def main():
         wheel_metadata = archive.read(next(name for name in names if name.endswith(".dist-info/WHEEL"))).decode()
         assert "Root-Is-Purelib: false" in wheel_metadata and "Tag: py3-none-" in wheel_metadata, wheel_metadata
         assert "-any" not in wheel_metadata, wheel_metadata
+        if args.platform == "macos":
+            wheel_arch = "x86_64" if args.arch == "amd64" else "arm64"
+            assert wheel.name.endswith(f"_{wheel_arch}.whl"), wheel.name
+            assert "_universal2" not in wheel_metadata, wheel_metadata
+            assert f"_{wheel_arch}\n" in wheel_metadata, wheel_metadata
     with tempfile.TemporaryDirectory(prefix="affine-install-") as directory:
         root = Path(directory)
         npm_root = root / "npm"
