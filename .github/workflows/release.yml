@@ -216,6 +216,8 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           cargo publish --dry-run --locked --registry crates-io
+          # Publish dry-runs use a temporary archive; create the release asset explicitly.
+          cargo package --locked --registry crates-io
           cp "target/package/affine-desktop-mcp-$VERSION.crate" dist/
       - name: Check assets and generate checksums
         if: steps.check.outputs.should_release == 'true'
