@@ -1,0 +1,21 @@
+{
+  "workspaceId": "<workspace-id-from-affine_list_workspaces>",
+  "documentId": "mcp-native-flowchart",
+  "title": "AFFiNE MCP — Native Diagram",
+  "direction": "TB",
+  "nodes": [
+    {"id": "client", "text": "Hermes / MCP client", "shape": "ellipse"},
+    {"id": "server", "text": "Rust stdio MCP server\nTyped tool parameters", "shape": "roundedRect"},
+    {"id": "guard", "text": "Offline write\nallowed?", "shape": "diamond"},
+    {"id": "database", "text": "Local workspace\nSQLite + Yjs", "shape": "rect"},
+    {"id": "saved", "text": "Saved native\neditable diagram", "shape": "ellipse"},
+    {"id": "blocked", "text": "Refuse\nunsafe write", "shape": "triangle", "fillColor": {"light": "#fee2e2", "dark": "#450a0a"}}
+  ],
+  "edges": [
+    {"id": "request", "source": "client", "target": "server", "text": "JSON MCP request"},
+    {"id": "validate", "source": "server", "target": "guard"},
+    {"id": "write", "source": "guard", "target": "database", "text": "Yes: editor closed"},
+    {"id": "commit", "source": "database", "target": "saved", "text": "Commit + readback"},
+    {"id": "reject", "source": "guard", "target": "blocked", "text": "No: editor running", "strokeColor": {"light": "#b91c1c", "dark": "#f87171"}}
+  ]
+}

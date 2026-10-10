@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags: ['*']
+
+permissions:
+  contents: read
+
+# Serialize publications, including equivalent v-prefixed/unprefixed tags.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check release eligibility
+    runs-on: ubuntu-24.04
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release helpers
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Check tag, manifest and existing releases
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release_check.py
+
+  build:
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            platform: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            platform: macos
+            arch: amd64
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: windows-2022
+            platform: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windows
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Smoke-test binary version
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          binary="target/$TARGET/release/affine-local-mcp"
+          if [[ "$PLATFORM" == "windows" ]]; then
+            binary="${binary}.exe"
+          fi
+          actual_version=$("$binary" --version | tr -d '\r')
+          test "$actual_version" = "$VERSION"
+      - name: Package executable, license and README
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          python .github/scripts/package_release.py \
+            --target "$TARGET" --platform "$PLATFORM" \
+            --arch "$ARCH" --version "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: [check, build]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Recheck release eligibility before publication
+        id: check
+        run: python3 .github/scripts/release_check.py
+      - uses: actions/download-artifact@v4
+        if: steps.check.outputs.should_release == 'true'
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Check assets and generate checksums
+        if: steps.check.outputs.should_release == 'true'
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          test "${#archives[@]}" -eq 6
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create release with all assets
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease --latest=false)
+          else
+            args+=(--prerelease=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"
+      - name: Verify published release and assets
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,assets --jq . > release.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          release = json.loads(Path("release.json").read_text())
+          expected = {asset.name for asset in Path("dist").iterdir()}
+          assert release["tagName"] == os.environ["GITHUB_REF_NAME"]
+          assert not release["isDraft"]
+          assert {asset["name"] for asset in release["assets"]} == expected
+          assert len(expected) == 7
+          print(f"Verified published release with {len(expected)} assets.")
+          PY
