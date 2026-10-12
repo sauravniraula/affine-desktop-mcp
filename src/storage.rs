@@ -16,8 +16,8 @@ use std::{
 };
 use uuid::Uuid;
 use yrs::{
-    Array, ArrayPrelim, Doc, In, Map, MapPrelim, Out, ReadTxn, TextPrelim, Transact, Update,
-    types::ToJson, updates::decoder::Decode,
+    Array, ArrayPrelim, Doc, In, Map, MapPrelim, MapRef, Out, ReadTxn, Text, TextPrelim, Transact,
+    Update, types::ToJson, updates::decoder::Decode,
 };
 
 #[derive(Clone)]
@@ -25,7 +25,7 @@ pub struct Storage {
     pub data_dir: PathBuf,
     pub allowlist: Option<HashSet<String>>,
     pub writes: bool,
-    write_lock: Arc<Mutex<()>>,
+    pub(crate) write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -128,6 +128,10 @@ impl Storage {
             if !entry.file_type()?.is_dir() || !identifier(&id) {
                 continue;
             }
+            // Matches AFFiNE Desktop's native listLocalWorkspaceIds exclusion.
+            if self.data_dir.join("deleted-workspaces").join(&id).is_dir() {
+                continue;
+            }
             if self
                 .allowlist
                 .as_ref()
@@ -155,7 +159,7 @@ impl Storage {
             .with_context(|| format!("Unknown or disallowed local workspace: {id}"))
     }
 
-    fn open(&self, id: &str, write: bool) -> Result<Connection> {
+    pub(crate) fn open(&self, id: &str, write: bool) -> Result<Connection> {
         let workspace = self.workspace(id)?;
         let flags = if write {
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -176,7 +180,7 @@ impl Storage {
         Ok(db)
     }
 
-    fn read<T>(
+    pub(crate) fn read<T>(
         &self,
         id: &str,
         operation: impl FnOnce(&Connection, &Value) -> Result<T>,
@@ -202,17 +206,31 @@ impl Storage {
     }
 
     pub fn list_documents(&self, workspace_id: &str, offset: usize, limit: usize) -> Result<Value> {
+        self.list_documents_in_state(workspace_id, offset, limit, false)
+    }
+
+    pub fn list_trash(&self, workspace_id: &str, offset: usize, limit: usize) -> Result<Value> {
+        self.list_documents_in_state(workspace_id, offset, limit, true)
+    }
+
+    fn list_documents_in_state(
+        &self,
+        workspace_id: &str,
+        offset: usize,
+        limit: usize,
+        trash: bool,
+    ) -> Result<Value> {
         ensure!(
             (1..=200).contains(&limit),
             "limit must be between 1 and 200"
         );
         self.read(workspace_id, |db, meta| {
-            let pages = active_pages(meta)?;
+            let pages = pages_in_state(meta, trash)?;
             let properties = optional_doc(db, "db$docProperties")?;
             let documents: Vec<_> = pages.iter().skip(offset).take(limit).map(|page| {
                 let id = page["id"].as_str().unwrap();
                 let mode = mode_for(properties.as_ref(), id).unwrap_or_else(|_| "unknown".into());
-                json!({"id": id, "title": page["title"].as_str().filter(|s| !s.is_empty()).unwrap_or("Untitled"), "mode": mode, "createdAt": page["createDate"], "updatedAt": page["updatedDate"]})
+                json!({"id": id, "title": page["title"].as_str().filter(|s| !s.is_empty()).unwrap_or("Untitled"), "mode": mode, "createdAt": page["createDate"], "updatedAt": page["updatedDate"], "trash": trash, "trashedAt": page["trashDate"], "tagIds": page["tags"].as_array().cloned().unwrap_or_default()})
             }).collect();
             let next = offset.saturating_add(documents.len());
             Ok(json!({"workspaceId": workspace_id, "documents": documents, "total": pages.len(), "hasMore": next < pages.len(), "nextOffset": if next < pages.len() {Some(next)} else {None}}))
@@ -320,7 +338,156 @@ impl Storage {
         )
     }
 
-    fn write(
+    pub fn update_document(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+        title: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<Value> {
+        ensure!(
+            title.is_some() || mode.is_some(),
+            "Supply title and/or mode"
+        );
+        if let Some(title) = title {
+            ensure!(
+                !title.trim().is_empty() && title.chars().count() <= 500,
+                "title must contain 1..500 characters"
+            );
+        }
+        if let Some(mode) = mode {
+            ensure!(
+                mode == "page" || mode == "edgeless",
+                "mode must be page or edgeless"
+            );
+        }
+        self.write(workspace_id, |db| {
+            let root = load_doc(db, workspace_id)?;
+            let page = document_entry(&root, workspace_id, document_id)?;
+            let meta = documents::root_json(&root, "meta")?;
+            let existing = active_document(db, &meta, document_id)?;
+            let document = load_doc(db, document_id)?;
+            let properties = optional_doc(db, "db$docProperties")?.unwrap_or_default();
+            let title_requested = title.is_some();
+            let title = title.map(str::trim).unwrap_or(&existing.title);
+            let previous_mode = mode_for(Some(&properties), document_id)?;
+            let mode = mode.unwrap_or(&previous_mode);
+            let registry_title = serde_json::to_value(page.to_json(&root.transact()))?;
+            let title_changed = title_requested && (title != existing.title || registry_title["title"] != title);
+            let mode_changed = mode != previous_mode;
+            if !title_changed && !mode_changed {
+                return Ok(json!({"workspaceId":workspace_id,"documentId":document_id,"title":title,"mode":mode,"changed":false}));
+            }
+            if title_changed {
+                let before = document.transact().state_vector();
+                {
+                    let mut txn = document.transact_mut();
+                    let blocks = txn.get_map("blocks").context("Missing blocks")?;
+                    let pages: Vec<_> = blocks.iter(&txn).filter_map(|(_, value)| {
+                        if let Out::YMap(block) = value
+                            && block.get(&txn, "sys:flavour").is_some_and(|v| v.to_string(&txn) == "affine:page") {
+                            Some(block)
+                        } else { None }
+                    }).collect();
+                    ensure!(pages.len() == 1, "Unsupported document: expected one page block");
+                    let Some(Out::YText(text)) = pages[0].get(&txn, "prop:title") else {
+                        bail!("Unsupported document: title must be native Y.Text");
+                    };
+                    // Keep the existing rich-text identity, rather than replacing the title type.
+                    let len = text.len(&txn);
+                    text.remove_range(&mut txn, 0, len);
+                    text.insert(&mut txn, 0, title);
+                }
+                append_update(db, document_id, &document.transact().encode_state_as_update_v1(&before))?;
+            }
+            if mode_changed {
+                let before = properties.transact().state_vector();
+                let map = properties.get_or_insert_map(document_id);
+                {
+                    let mut txn = properties.transact_mut();
+                    map.insert(&mut txn, "id", document_id);
+                    map.insert(&mut txn, "primaryMode", mode);
+                }
+                append_update(db, "db$docProperties", &properties.transact().encode_state_as_update_v1(&before))?;
+            }
+            let before = root.transact().state_vector();
+            {
+                let mut txn = root.transact_mut();
+                if title_changed {
+                    page.insert(&mut txn, "title", title);
+                }
+                page.insert(&mut txn, "updatedDate", Utc::now().timestamp_millis() as f64);
+            }
+            append_update(db, workspace_id, &root.transact().encode_state_as_update_v1(&before))?;
+            let saved_meta = registry(db, workspace_id)?;
+            let saved = active_document(db, &saved_meta, document_id)?;
+            let saved_page = active_pages(&saved_meta)?.into_iter().find(|page| page["id"] == document_id).context("Missing saved registry entry")?;
+            ensure!(
+                saved.title == title
+                    && (!title_changed || saved_page["title"] == title)
+                    && mode_for(optional_doc(db, "db$docProperties")?.as_ref(), document_id)? == mode
+                    && documents::root_json(&load_doc(db, document_id)?, "blocks")? == documents::root_json(&document, "blocks")?,
+                "Document update readback failed"
+            );
+            Ok(json!({"workspaceId":workspace_id,"documentId":document_id,"title":title,"mode":mode,"changed":true}))
+        })
+    }
+
+    pub fn delete_document(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+        confirm: bool,
+    ) -> Result<Value> {
+        ensure!(
+            confirm,
+            "Document deletion requires confirm=true; moves the document to trash"
+        );
+        self.set_document_trash(workspace_id, document_id, true)
+    }
+
+    pub fn restore_document(&self, workspace_id: &str, document_id: &str) -> Result<Value> {
+        self.set_document_trash(workspace_id, document_id, false)
+    }
+
+    fn set_document_trash(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+        trash: bool,
+    ) -> Result<Value> {
+        self.write(workspace_id, |db| {
+            let root = load_doc(db, workspace_id)?;
+            let page = document_entry(&root, workspace_id, document_id)?;
+            let previous = serde_json::to_value(page.to_json(&root.transact()))?;
+            let changed = previous["trash"].as_bool().unwrap_or(false) != trash;
+            if !trash {
+                // Do not restore registry entries whose local contents are missing or corrupt.
+                documents::render(&load_doc(db, document_id)?)?;
+            }
+            if changed {
+                let before = root.transact().state_vector();
+                {
+                    let mut txn = root.transact_mut();
+                    page.insert(&mut txn, "trash", trash);
+                    if trash {
+                        page.insert(&mut txn, "trashDate", Utc::now().timestamp_millis() as f64);
+                    } else {
+                        page.remove(&mut txn, "trashDate");
+                    }
+                }
+                append_update(db, workspace_id, &root.transact().encode_state_as_update_v1(&before))?;
+            }
+            let saved_root = load_doc(db, workspace_id)?;
+            let saved_page = document_entry(&saved_root, workspace_id, document_id)?;
+            let saved = serde_json::to_value(saved_page.to_json(&saved_root.transact()))?;
+            let expected = serde_json::to_value(page.to_json(&root.transact()))?;
+            ensure!(saved == expected, "Document trash readback failed");
+            Ok(json!({"workspaceId":workspace_id,"documentId":document_id,"trash":trash,"trashedAt":saved["trashDate"],"changed":changed}))
+        })
+    }
+
+    pub(crate) fn write(
         &self,
         workspace_id: &str,
         operation: impl FnOnce(&Connection) -> Result<Value>,
@@ -632,7 +799,7 @@ fn validate_schema(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn optional_doc(db: &Connection, id: &str) -> Result<Option<Doc>> {
+pub(crate) fn optional_doc(db: &Connection, id: &str) -> Result<Option<Doc>> {
     let snapshot: Option<Vec<u8>> = db
         .query_row("SELECT data FROM snapshots WHERE doc_id=?", [id], |row| {
             row.get(0)
@@ -662,7 +829,7 @@ fn optional_doc(db: &Connection, id: &str) -> Result<Option<Doc>> {
     Ok(Some(doc))
 }
 
-fn load_doc(db: &Connection, id: &str) -> Result<Doc> {
+pub(crate) fn load_doc(db: &Connection, id: &str) -> Result<Doc> {
     optional_doc(db, id)?.with_context(|| format!("Document not stored locally: {id}"))
 }
 
@@ -672,7 +839,11 @@ fn registry(db: &Connection, id: &str) -> Result<Value> {
     Ok(meta)
 }
 
-fn active_pages(meta: &Value) -> Result<Vec<&Value>> {
+pub(crate) fn active_pages(meta: &Value) -> Result<Vec<&Value>> {
+    pages_in_state(meta, false)
+}
+
+fn pages_in_state(meta: &Value, trash: bool) -> Result<Vec<&Value>> {
     let pages = meta["pages"]
         .as_array()
         .context("Unsupported workspace: missing active document registry")?;
@@ -681,7 +852,7 @@ fn active_pages(meta: &Value) -> Result<Vec<&Value>> {
         .iter()
         .filter(|page| {
             page["id"].as_str().is_some_and(|id| seen.insert(id))
-                && !page["trash"].as_bool().unwrap_or(false)
+                && page["trash"].as_bool().unwrap_or(false) == trash
         })
         .collect())
 }
@@ -692,6 +863,37 @@ fn active_document(db: &Connection, meta: &Value, id: &str) -> Result<Rendered> 
         "Document is not active in this workspace: {id}"
     );
     documents::render(&load_doc(db, id)?)
+}
+
+pub(crate) fn document_entry(root: &Doc, workspace_id: &str, document_id: &str) -> Result<MapRef> {
+    ensure!(
+        identifier(document_id) && document_id != workspace_id,
+        "Invalid or internal documentId"
+    );
+    let txn = root.transact();
+    let meta = txn.get_map("meta").context("Missing metadata")?;
+    let Some(Out::YArray(pages)) = meta.get(&txn, "pages") else {
+        bail!("Unsupported registry: pages must be a Y.Array");
+    };
+    let entries: Vec<_> = pages
+        .iter(&txn)
+        .filter_map(|value| {
+            if let Out::YMap(page) = value
+                && page
+                    .get(&txn, "id")
+                    .is_some_and(|id| id.to_string(&txn) == document_id)
+            {
+                Some(page)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ensure!(
+        entries.len() == 1,
+        "Expected one registered document in this workspace: {document_id}"
+    );
+    Ok(entries[0].clone())
 }
 
 fn mode_for(properties: Option<&Doc>, id: &str) -> Result<String> {
@@ -708,7 +910,7 @@ fn mode_for(properties: Option<&Doc>, id: &str) -> Result<String> {
         .unwrap_or_else(|| "page".into()))
 }
 
-fn append_update(db: &Connection, id: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn append_update(db: &Connection, id: &str, bytes: &[u8]) -> Result<()> {
     let latest: Option<String> = db.query_row(
         "SELECT max(timestamp) FROM clocks WHERE doc_id=?",
         [id],

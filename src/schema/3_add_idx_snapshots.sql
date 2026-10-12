@@ -1,0 +1,6 @@
+
+CREATE TABLE idx_snapshots (
+  index_name TEXT PRIMARY KEY NOT NULL,
+  data BLOB NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);

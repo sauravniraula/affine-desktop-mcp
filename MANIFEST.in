@@ -1,4 +1,4 @@
 include Cargo.toml Cargo.lock setup.py
-recursive-include src *.rs
+recursive-include src *.rs *.sql
 recursive-include python *.py
 exclude python/affine_desktop_mcp/bin/*
