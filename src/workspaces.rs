@@ -199,7 +199,9 @@ fn lifecycle_lock(data_dir: &Path) -> Result<fs::File> {
 /// appears after preflight. Source and destination names are single validated segments.
 fn rename_directory_no_replace(from: &Dir, source: &str, to: &Dir, target: &str) -> Result<()> {
     ensure!(
-        !source.contains('/')
+        !source.is_empty()
+            && !target.is_empty()
+            && !source.contains('/')
             && !target.contains('/')
             && !source.contains('\\')
             && !target.contains('\\'),
@@ -241,9 +243,55 @@ fn rename_directory_no_replace(from: &Dir, source: &str, to: &Dir, target: &str)
             std::io::Error::last_os_error()
         );
     }
-    // Windows directory moves fail if the target exists; cap-std anchors both paths.
+    // Ordinary Windows rename also replaces empty directories. Use a directory
+    // handle and FileRenameInfo with replacement explicitly disabled instead.
     #[cfg(windows)]
-    from.rename(source, to, target)?;
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use std::{
+            mem::{offset_of, size_of},
+            os::windows::io::AsRawHandle,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
+            SetFileInformationByHandle,
+        };
+
+        let directory = from.open_with(
+            source,
+            OpenOptions::new()
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS),
+        )?;
+        let name: Vec<u16> = target.encode_utf16().chain([0]).collect();
+        let bytes = offset_of!(FILE_RENAME_INFO, FileName) + name.len() * size_of::<u16>();
+        // usize storage supplies the alignment required by FILE_RENAME_INFO's HANDLE.
+        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: the aligned allocation holds the complete struct and UTF-16 name.
+        // Both handles remain alive, the destination is a single relative segment,
+        // and FileNameLength excludes the terminating NUL as required by Win32.
+        let result = unsafe {
+            std::ptr::write(info, FILE_RENAME_INFO::default());
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = to.as_raw_handle();
+            (*info).FileNameLength = ((name.len() - 1) * size_of::<u16>()).try_into()?;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            SetFileInformationByHandle(
+                directory.as_raw_handle(),
+                FileRenameInfo,
+                info.cast(),
+                bytes.try_into()?,
+            )
+        };
+        ensure!(
+            result != 0,
+            "Atomic directory rename failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     Ok(())
 }
 

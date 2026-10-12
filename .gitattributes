@@ -1,0 +1,2 @@
+# Native SQLx migration checksums depend on exact LF bytes on every platform.
+src/schema/*.sql text eol=lf
