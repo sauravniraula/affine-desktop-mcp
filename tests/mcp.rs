@@ -1,8 +1,14 @@
 #[path = "common/canvas_journey.rs"]
 mod canvas_journey;
 mod common;
+#[path = "common/document_journey.rs"]
+mod document_journey;
 #[path = "common/drawing_journey.rs"]
 mod drawing_journey;
+#[path = "common/organization_journey.rs"]
+mod organization_journey;
+#[path = "common/workspace_journey.rs"]
+mod workspace_journey;
 use common::{WORKSPACE, db_path, fixture};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -107,6 +113,8 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
     let tools = tools["result"]["tools"].as_array().unwrap();
     let expected_tools = [
         "affine_list_workspaces",
+        "affine_create_workspace",
+        "affine_delete_workspace",
         "affine_list_documents",
         "affine_read_document",
         "affine_search_documents",
@@ -117,6 +125,17 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
         "affine_draw_pen",
         "affine_erase_canvas",
         "affine_import_media",
+        "affine_update_document",
+        "affine_delete_document",
+        "affine_restore_document",
+        "affine_list_trash",
+        "affine_list_tags",
+        "affine_manage_tag",
+        "affine_set_document_tags",
+        "affine_list_collections",
+        "affine_manage_collection",
+        "affine_list_folders",
+        "affine_manage_folder",
     ];
     assert_eq!(tools.len(), expected_tools.len());
     for name in expected_tools {
@@ -134,11 +153,20 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
             .count(),
         [
             "affine_create_document",
+            "affine_create_workspace",
+            "affine_delete_workspace",
             "affine_create_diagram",
             "affine_edit_canvas",
             "affine_draw_pen",
             "affine_erase_canvas",
-            "affine_import_media"
+            "affine_import_media",
+            "affine_update_document",
+            "affine_delete_document",
+            "affine_restore_document",
+            "affine_manage_tag",
+            "affine_set_document_tags",
+            "affine_manage_collection",
+            "affine_manage_folder"
         ]
         .len()
     );
@@ -320,6 +348,9 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
 
     canvas_journey::run(&mut client, &storage);
     drawing_journey::run(&mut client, &storage);
+    document_journey::run(&mut client, &storage);
+    organization_journey::run(&mut client, &storage);
+    workspace_journey::run(&mut client, &storage);
 
     // Simulate an AFFiNE process using an owned copy, never touch the user's application.
     let fake_app = storage.data_dir.join(if cfg!(windows) {
@@ -343,12 +374,56 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
     let pen_guarded = client.call("affine_draw_pen",json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","strokes":[{"id":"pen","points":[[0,0],[100,100]]}]}));
     let erase_guarded = client.call("affine_erase_canvas",json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","strokeIds":["pen"],"confirm":true}));
     let media_guarded = client.call("affine_import_media",json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","media":[{"id":"image","filePath":"sample.png","position":[0,0]}]}));
+    let update_guarded = client.call(
+        "affine_update_document",
+        json!({"workspaceId":WORKSPACE,"documentId":"managed-page","title":"Blocked"}),
+    );
+    let delete_guarded = client.call(
+        "affine_delete_document",
+        json!({"workspaceId":WORKSPACE,"documentId":"managed-page","confirm":true}),
+    );
+    let restore_guarded = client.call(
+        "affine_restore_document",
+        json!({"workspaceId":WORKSPACE,"documentId":"managed-page"}),
+    );
+    let tag_guarded = client.call(
+        "affine_manage_tag",
+        json!({"workspaceId":WORKSPACE,"action":"create","name":"Blocked"}),
+    );
+    let tags_guarded = client.call(
+        "affine_set_document_tags",
+        json!({"workspaceId":WORKSPACE,"documentId":"managed-page","tagIds":[]}),
+    );
+    let collection_guarded = client.call(
+        "affine_manage_collection",
+        json!({"workspaceId":WORKSPACE,"action":"create","name":"Blocked"}),
+    );
+    let folder_guarded = client.call(
+        "affine_manage_folder",
+        json!({"workspaceId":WORKSPACE,"action":"create","kind":"folder","name":"Blocked"}),
+    );
+    let workspace_create_guarded =
+        client.call("affine_create_workspace", json!({"name":"Blocked"}));
+    let workspace_delete_guarded = client.call("affine_delete_workspace", json!({"workspaceId":"guard-workspace","confirmName":"Concurrent workspace","confirm":true}));
     let _ = fake.kill();
     let _ = fake.wait();
     assert_eq!(guarded["isError"], true);
     assert_eq!(diagram_guarded["isError"], true);
     assert_eq!(edit_guarded["isError"], true);
-    for guarded in [&pen_guarded, &erase_guarded, &media_guarded] {
+    for guarded in [
+        &pen_guarded,
+        &erase_guarded,
+        &media_guarded,
+        &update_guarded,
+        &delete_guarded,
+        &restore_guarded,
+        &tag_guarded,
+        &tags_guarded,
+        &collection_guarded,
+        &folder_guarded,
+        &workspace_create_guarded,
+        &workspace_delete_guarded,
+    ] {
         assert_eq!(guarded["isError"], true);
         assert!(
             guarded["structuredContent"]["error"]

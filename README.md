@@ -18,8 +18,7 @@ offline-only opt-in.
 > The Cargo, npm and Python packages are all **`affine-desktop-mcp`**.
 > The npm and Python launcher command is also **`affine-desktop-mcp`**.
 > The standalone executable (including Cargo installs) remains **`affine-local-mcp`**
-> (`affine-local-mcp.exe` on Windows). Registry packages are prepared here but
-> have **not yet been published**; registry install commands below apply after release.
+> (`affine-local-mcp.exe` on Windows). Packages are published on crates.io, npm and PyPI.
 
 ## Contents
 
@@ -165,8 +164,7 @@ notes and AFFiNE version compatibility before enabling writes again.
 
 ## Install with npm or pip
 
-**These packages have not yet been published.** The following registry commands
-will work after publication. Both packages bundle the same native Rust server;
+Both registry packages bundle the same native Rust server;
 they do not reimplement it or enable writes. Installation uses the package
 registry, but the installed server runs offline and never downloads a binary at
 startup. macOS, glibc Linux and Windows are supported on x64 and arm64.
@@ -408,8 +406,9 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 | Linux | `$XDG_CONFIG_HOME/AFFiNE` (fallback: `~/.config/AFFiNE`) |
 
 Only `workspaces/local/<workspace-id>/storage.db` beneath this directory is
-considered. Cloud caches, userspaces, trashed documents and unregistered leftover
-documents are excluded. Symlinked workspace directories and database paths
+considered. Cloud caches, userspaces and unregistered leftover documents are
+excluded. Trashed documents are exposed only through the explicit trash-management
+tools, not normal reads/search/listing. Symlinked workspace directories and database paths
 escaping the configured root are not exposed.
 
 For Flatpak, portable, beta, renamed, or custom installations, set
@@ -721,10 +720,23 @@ successful workspace listing and document read are the useful first checks.
 | Tool | Parameters / behavior |
 | --- | --- |
 | `affine_list_workspaces` | Lists local workspace IDs, names and active document counts |
+| `affine_create_workspace` | `name`, optional stable `workspaceId`; create an empty native local workspace |
+| `affine_delete_workspace` | `workspaceId`, exact `confirmName`, `confirm: true`; back up and move the whole workspace to native deleted-workspaces |
 | `affine_list_documents` | `workspaceId`, optional `offset`/`limit`; active documents and primary page/edgeless mode |
 | `affine_read_document` | `workspaceId`, `documentId`, optional `offset`/`maxChars`; best-effort Markdown, warnings and continuation |
 | `affine_search_documents` | `workspaceId`, `query`, optional `offset`/`limit`; literal case-insensitive title/body search |
 | `affine_create_document` | `workspaceId`, `title`, `content`, optional `mode` (`page` or `edgeless`) and `documentId`; offline-only creation |
+| `affine_update_document` | `workspaceId`, `documentId`, optional `title` and/or `mode`; rename or change primary mode without replacing content |
+| `affine_delete_document` | `workspaceId`, `documentId`, required `confirm: true`; move to trash, never permanently purge |
+| `affine_list_trash` | `workspaceId`, optional `offset`/`limit`; list trashed document IDs, titles, modes and `trashedAt` timestamps |
+| `affine_restore_document` | `workspaceId`, `documentId`; restore from trash without changing content or primary mode |
+| `affine_list_tags` | `workspaceId`, optional `offset`/`limit`; native tag IDs, `value` (name), colors and timestamps |
+| `affine_manage_tag` | `workspaceId`, `action` (`create`, `update`, `delete`), optional `tagId`, `name`, `color`, `confirm`; tag CRUD |
+| `affine_set_document_tags` | `workspaceId`, `documentId`, `tagIds`; replace assignments with existing tags; `[]` clears |
+| `affine_list_collections` | `workspaceId`, optional `offset`/`limit`; stored definitions, rules and explicit `allowList`, not evaluated smart membership |
+| `affine_manage_collection` | `workspaceId`, `action`, optional `collectionId`, `name`, `addDocumentIds`, `removeDocumentIds`, `confirm`; collection CRUD and explicit membership |
+| `affine_list_folders` | `workspaceId`, optional `offset`/`limit`; native folder-tree nodes, parents, kinds, names/target IDs and sorting indexes |
+| `affine_manage_folder` | `workspaceId`, `action`, optional `nodeId`, `kind`, `name`, `targetId`, `parentId`, `index`, `confirm`; create/rename/move/reorder/delete folders and shortcuts |
 | `affine_create_diagram` | `workspaceId`, `title`, `nodes`, optional `edges`, `documentId`, `direction` (`TB` or `LR`); native shapes/connectors, not a note |
 | `affine_read_canvas` | `workspaceId`, `documentId`; native primitives in `elements`, native frame/link/media blocks in `blocks`, with IDs/properties |
 | `affine_edit_canvas` | `workspaceId`, `documentId`, optional `nodes`, `edges`, `strokes`, `curves`, `frames`, `links`, `media`, `deleteIds`, `confirmDelete`; atomic native-object upsert/delete |
@@ -768,6 +780,123 @@ AFFiNE's `db$docProperties` document, so it opens in Edgeless mode. Content is
 Use a stable `documentId` for retries. Repeating the same ID/title/content/mode
 returns `alreadyExists: true`; a conflicting document is rejected, never
 replaced. Omitting the ID generates a new UUID on each successful invocation.
+
+### Create and delete workspaces
+
+`affine_create_workspace` takes a nonblank `name` (at most 500 characters) and an
+optional stable `workspaceId`. It initializes an **empty local workspace** with
+AFFiNE 0.27.4's SQLite schema, exact SQLx migration checksums and native Yjs
+metadata. It never migrates an existing database. The initialized database is
+validated and backed up before `storage.db` is published, so AFFiNE's native
+directory discovery sees only the completed workspace after reopening.
+Publication and archival use atomic no-replace directory moves anchored to
+directory handles, and an OS file lock serializes workspace lifecycle calls from
+separate MCP processes. Failed/interrupted creations may retain a hidden
+`mcp-staging/.mcp-create-<uuid>` staging directory and a backup; these are never discovered
+as workspaces, never reserve the requested ID, and are not recursively erased.
+Retries can publish a fresh stage without touching those recovery files.
+
+For example, create with
+`{"name":"Project","workspaceId":"my-project-workspace"}`, then use the returned
+ID with document and organization tools. Retrying the same ID/name preserves
+existing content and returns `alreadyExists: true`; conflicts are rejected.
+When a workspace allowlist is configured, new IDs **must already be in it**;
+creation never silently expands your allowed scope.
+
+`affine_delete_workspace` requires `workspaceId`, **`confirm: true`**, and
+**`confirmName` equal to its exact current display name**. It validates a
+consistent SQLite backup, closes its connection, and moves the entire local
+workspace directory (including blobs, sidecars and WAL/SHM files) to
+`<AFFINE_DATA_DIR>/deleted-workspaces/<workspaceId>`. This matches AFFiNE's native
+deleted-workspace storage; recover it through AFFiNE's deleted-workspace UI.
+The workspace is no longer available through ordinary MCP tools.
+
+This is **not a permanent purge**. Existing deleted-workspace backups are never
+overwritten, and deleted IDs cannot be reused by creation. A repeated confirmed
+delete returns `alreadyDeleted: true` while its archived workspace remains.
+Database/directory symlinks and IDs with legacy v1 workspace directories are
+rejected; manage those through AFFiNE instead of risking partial data removal.
+Both tools require writes enabled and AFFiNE completely closed; reopen it after
+completion. Tool results include the backup path and, on deletion, archive path.
+
+### Manage and delete documents
+
+All mutations require writes enabled and AFFiNE Desktop **completely closed**.
+Use IDs from `affine_list_documents` (or `affine_list_trash` for recovery).
+
+- Call `affine_update_document` with `title`, `mode`, or both. For example:
+  `{"workspaceId":"<local-workspace-id>","documentId":"my-stable-mcp-page-id","title":"Meeting notes","mode":"page"}`.
+  Titles are nonblank, trimmed and at most 500 characters. A rename updates both
+  the native rich-text title and workspace registry. Omitted fields, body text,
+  canvas objects, tags and unrelated properties are preserved. Changing mode
+  only changes how AFFiNE opens the document; it does not convert content.
+- Call `affine_delete_document` with the IDs and **`"confirm": true`** to move
+  the document to AFFiNE's trash. Its contents, shared media and incoming links
+  are retained. Active listing, search, reads and edits exclude it afterward.
+  **Permanent deletion and empty-trash are deliberately not provided.**
+- Call `affine_list_trash` to browse recoverable IDs. Like active listing, it
+  supports `offset` and `limit` (1..200, default 100); follow `nextOffset`.
+  This read-only tool works without enabling writes.
+- Call `affine_restore_document` with the IDs to clear the trash state and
+  timestamp. Local contents must still be present and readable. Internal,
+  unregistered and disallowed-workspace documents cannot be managed.
+
+Mutations return `changed`, `backupPath` and `reopenAffine`. Repeating a completed
+update/delete/restore is a no-op (`changed: false`); it does not append more Yjs
+updates or change timestamps, though the usual backup still occurs. Every
+mutation uses the same guarded, backed-up transaction as creation. Reopen
+AFFiNE after completing the tools to see the new title/mode/trash state.
+
+### Organize folders, tags and collections
+
+Organization tools use AFFiNE's native workspace data, **not filesystem folders**.
+All list tools are read-only and paginated (`offset`, `limit` 1..200); mutations
+require writes enabled, AFFiNE closed, and `confirm: true` for deletions. Use stable
+IDs on create for safe retries; omitting the ID generates a new UUID. Updating an
+unknown ID fails, and a conflicting create never overwrites an existing record.
+
+**Tags:** `affine_manage_tag` creates (`action: "create"`, `name`, optional
+`tagId`/`color`), renames/recolors (`action: "update"`, `tagId`), or deletes
+(`action: "delete"`, `tagId`, `confirm: true`). Colors accept hex or an AFFiNE
+`--affine-tag-...` token; the create default is `--affine-tag-blue`.
+`affine_set_document_tags` replaces an active document's tag IDs, while
+`affine_list_documents` and `affine_list_trash` expose current `tagIds`.
+Deleting a tag removes assignments from active **and trashed** documents and
+removes its explorer shortcuts. It never deletes documents or rewrites collection
+rules that mention the tag; review those rules in AFFiNE if necessary.
+
+**Collections:** Create with a name and optional `addDocumentIds`; update with
+a new name and/or `addDocumentIds`/`removeDocumentIds` (up to 200 unique IDs each).
+New collections use explicit membership with empty filters. Existing smart or
+legacy rules and unrelated fields are preserved. Lists return stored definitions,
+**not evaluated smart-filter results**. Removing an explicit member does not
+exclude a document that still matches a smart rule. Deleting a collection removes
+its folder shortcuts and pinned record, never its documents. Editing smart rules
+is left to AFFiNE's UI.
+
+**Folders and shortcuts:** `affine_manage_folder` creates nodes with `kind` equal
+to `folder`, `doc`, `tag` or `collection`. Folders use `name`; shortcuts use
+`targetId` and require a parent folder. A document can have multiple shortcuts;
+moving/removing one does not move or delete its content. Node IDs and target IDs
+are distinct. Example create arguments:
+
+```json
+{"workspaceId":"<local-workspace-id>","action":"create","nodeId":"project-folder","kind":"folder","name":"Project"}
+```
+
+Then add a document shortcut:
+
+```json
+{"workspaceId":"<local-workspace-id>","action":"create","nodeId":"project-doc-link","kind":"doc","targetId":"<active-document-id>","parentId":"project-folder"}
+```
+
+Update a node by `nodeId` to rename a folder, move it with `parentId`, reorder it
+with a native fractional `index`, or retarget a shortcut with `targetId`. Omitted
+parent preserves the existing parent; `parentId: ""` moves a **folder** to root.
+Only folders may be root nodes. Omitted index appends on create/move and stays
+unchanged on rename. Node kind cannot change, and missing parents, invalid targets,
+self-parenting and descendant cycles fail atomically. Deleting a folder recursively
+removes descendant folders and shortcuts, **never their target entities**.
 
 ### Create a real diagram
 
@@ -929,8 +1058,9 @@ An immediate SQLite transaction atomically appends:
 
 The document is reconstructed and checked before commit. Failure rolls back all
 dependent updates and clocks. Reads reconstruct snapshots plus unmerged updates
-from one SQLite transaction. The implementation never runs AFFiNE migrations or
-changes the storage schema.
+from one SQLite transaction. Existing workspace writes never run AFFiNE
+migrations or change their storage schema. Workspace creation alone initializes
+a new database from the pinned AFFiNE 0.27.4 native schema.
 
 Canvas edits atomically append native primitive/block and registry `updatedDate`
 updates with their clocks and imported blob rows, and reconstruct the complete
@@ -1010,6 +1140,20 @@ frame locks, retained frame titles/membership, cycle/duplicate-owner rejection,
 external/local link validation, actual media-byte persistence, deduplication,
 shared-blob preservation, import-root/symlink containment, and combined
 canvas/blob rollback through actual MCP stdio calls.
+Document-management tests cover Unicode renames, retained native title identity,
+primary-mode changes, preserved content/canvas, confirmed trash, paginated trash
+listing, restore, no-op retries, read-only/running-app refusal and atomic rollback
+of title/mode/registry/clocks after injected failures.
+Organization tests use independently generated JavaScript Yjs tags, collections,
+folder rows and pins. They exercise CRUD, assignments, explicit membership,
+rule/property preservation, nested moves/reordering, cycles, recursive shortcut
+deletion, native ORM tombstones, safe retries, permissions and multi-document
+rollback (including folder links and pins).
+Workspace lifecycle tests cover empty initialization, authoritative upstream
+migration checksums, document/organization creation inside new workspaces,
+stable-ID conflicts/cross-process concurrency, allowlists, failed-create nonpublication, exact-name
+delete confirmation, retained blobs/sidecars, valid backups, native archive
+discovery exclusion, retries and read-only/running-app refusal.
 These are storage/MCP tests, not a desktop screenshot or visual-rendering test.
 
 The [GitHub Actions matrix](https://github.com/sauravniraula/affine-desktop-mcp/actions)

@@ -25,5 +25,13 @@ synthetic test data, not copies of personal AFFiNE documents.
   (a real 8x8 RGB PNG with computed CRCs) and `sample-attachment.txt`; their
   SHA-256/base64url IDs match the native media references. All are synthetic.
 
+- `organization-root-update.bin`: independent workspace tag options as native
+  Y.Map/Y.Array values and a collection with smart rules as a plain JSON item in
+  `setting.collections`. Unrelated settings/properties test preservation.
+- `organization-folders.bin`: `db$folders` ORM root maps for a folder and document,
+  tag and collection shortcuts, plus a `$$DELETED` tombstone.
+- `organization-pins.bin`: a native pinned-collection ORM row. Regenerate these
+  three with `generate-organization.mjs` using the same `YJS_MODULE` override.
+
 They verify that the Rust Yrs decoder reads independently produced Yjs data,
 including native surface wrappers, rich-text values and pending updates.

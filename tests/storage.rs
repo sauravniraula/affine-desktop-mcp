@@ -102,6 +102,76 @@ fn unicode_pagination_and_workspace_allowlist() {
 }
 
 #[test]
+fn trash_listing_is_read_only_paginated_and_allowlisted() {
+    let (_dir, mut storage) = fixture();
+    storage.writes = false;
+    let before = fs::read(db_path(&storage)).unwrap();
+    let trash = storage.list_trash(WORKSPACE, 0, 1).unwrap();
+    assert_eq!(trash["total"], 1);
+    assert_eq!(trash["documents"][0]["id"], "fixture-trash");
+    assert_eq!(trash["documents"][0]["trash"], true);
+    assert_eq!(trash["hasMore"], false);
+    assert_eq!(
+        storage.list_trash(WORKSPACE, usize::MAX, 100).unwrap()["documents"],
+        json!([])
+    );
+    assert!(storage.list_trash(WORKSPACE, 0, 0).is_err());
+    assert!(storage.list_trash(WORKSPACE, 0, 201).is_err());
+    assert_eq!(fs::read(db_path(&storage)).unwrap(), before);
+    assert!(!storage.data_dir.join("mcp-backups").exists());
+    storage.allowlist = Some(HashSet::new());
+    assert!(storage.list_trash(WORKSPACE, 0, 100).is_err());
+}
+
+#[test]
+fn document_management_rejects_invalid_inputs_before_writing() {
+    let (_dir, storage) = fixture();
+    let before = fs::read(db_path(&storage)).unwrap();
+    for (title, mode) in [
+        (None, None),
+        (Some("  "), None),
+        (Some("Title"), Some("invalid")),
+    ] {
+        assert!(
+            storage
+                .update_document(WORKSPACE, "fixture-page", title, mode)
+                .is_err()
+        );
+    }
+    assert!(
+        storage
+            .update_document(WORKSPACE, "fixture-page", Some(&"x".repeat(501)), None)
+            .is_err()
+    );
+    assert!(
+        storage
+            .delete_document(WORKSPACE, "fixture-page", false)
+            .is_err()
+    );
+    use affine_local_mcp::server::{DeleteDocumentParams, UpdateDocumentParams};
+    assert!(
+        serde_json::from_value::<UpdateDocumentParams>(
+            json!({"workspaceId":WORKSPACE,"documentId":"fixture-page","mode":"invalid"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<UpdateDocumentParams>(
+            json!({"workspaceId":WORKSPACE,"documentId":"fixture-page","content":"Not supported"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<DeleteDocumentParams>(
+            json!({"workspaceId":WORKSPACE,"documentId":"fixture-page"})
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(db_path(&storage)).unwrap(), before);
+    assert!(!storage.data_dir.join("mcp-backups").exists());
+}
+
+#[test]
 fn corrupt_and_incomplete_updates_fail_without_silently_returning_partial_text() {
     let (_dir, storage) = fixture();
     let db = Connection::open(db_path(&storage)).unwrap();
