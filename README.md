@@ -189,7 +189,7 @@ npx --yes affine-desktop-mcp --check
 For a stdio MCP client, use `"command": "npx"` and
 `"args": ["--yes", "affine-desktop-mcp"]`. On Windows use `npx.cmd` if your
 client requires the command shim. For reproducibility, pin the package in args
-to a published version, for example `affine-desktop-mcp@0.2.2`. GUI clients may
+to a published version, for example `affine-desktop-mcp@0.3.0`. GUI clients may
 need the absolute path to `npx` or the installed launcher.
 
 ### pip / pipx / uvx
@@ -218,7 +218,7 @@ uvx affine-desktop-mcp --check
 
 Use the installed launcher's absolute path as your MCP client's `command`, with
 empty `args`, or use `"command": "uvx"`, `"args": ["affine-desktop-mcp"]`.
-Pin a published version with `affine-desktop-mcp==0.2.2` in uvx's args.
+Pin a published version with `affine-desktop-mcp==0.3.0` in uvx's args.
 `python -m affine_desktop_mcp` is also supported. Do not put diagnostic flags
 such as `--check` into the client's launch arguments. The configuration variables,
 allowlists and offline-write safety rules below apply to both launchers unchanged.
