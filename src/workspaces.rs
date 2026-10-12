@@ -243,8 +243,8 @@ fn rename_directory_no_replace(from: &Dir, source: &str, to: &Dir, target: &str)
             std::io::Error::last_os_error()
         );
     }
-    // Ordinary Windows rename also replaces empty directories. Use a directory
-    // handle and FileRenameInfo with replacement explicitly disabled instead.
+    // Ordinary Windows rename also replaces empty directories. The NT API supports
+    // directory-relative destination handles; the Win32 wrapper rejects this form.
     #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt;
@@ -252,44 +252,55 @@ fn rename_directory_no_replace(from: &Dir, source: &str, to: &Dir, target: &str)
             mem::{offset_of, size_of},
             os::windows::io::AsRawHandle,
         };
-        use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
-            SetFileInformationByHandle,
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{
+                FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+            },
+            Win32::{
+                Foundation::RtlNtStatusToDosError,
+                Storage::FileSystem::{
+                    DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                    FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+                },
+                System::IO::IO_STATUS_BLOCK,
+            },
         };
 
         let directory = from.open_with(
             source,
             OpenOptions::new()
-                .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS),
         )?;
         let name: Vec<u16> = target.encode_utf16().chain([0]).collect();
-        let bytes = offset_of!(FILE_RENAME_INFO, FileName) + name.len() * size_of::<u16>();
-        // usize storage supplies the alignment required by FILE_RENAME_INFO's HANDLE.
+        let bytes = offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * size_of::<u16>();
+        // usize storage supplies the alignment required by the structure's HANDLE.
         let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut io_status = IO_STATUS_BLOCK::default();
         // SAFETY: the aligned allocation holds the complete struct and UTF-16 name.
         // Both handles remain alive, the destination is a single relative segment,
-        // and FileNameLength excludes the terminating NUL as required by Win32.
+        // and FileNameLength excludes the terminating NUL as required by the NT API.
         let result = unsafe {
-            std::ptr::write(info, FILE_RENAME_INFO::default());
+            std::ptr::write(info, FILE_RENAME_INFORMATION::default());
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = to.as_raw_handle();
             (*info).FileNameLength = ((name.len() - 1) * size_of::<u16>()).try_into()?;
             std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-            SetFileInformationByHandle(
+            NtSetInformationFile(
                 directory.as_raw_handle(),
-                FileRenameInfo,
+                &mut io_status,
                 info.cast(),
                 bytes.try_into()?,
+                FileRenameInformation,
             )
         };
         ensure!(
-            result != 0,
+            result >= 0,
             "Atomic directory rename failed: {}",
-            std::io::Error::last_os_error()
+            // SAFETY: converting a returned NTSTATUS has no pointer arguments.
+            std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32)
         );
     }
     Ok(())
