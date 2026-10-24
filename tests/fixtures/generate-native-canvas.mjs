@@ -21,7 +21,7 @@ for (const [id, index, text, shapeType, xywh] of [
   ['js-start', 'a0', 'Independent shape 🌏', 'ellipse', '[100,100,260,120]'],
   ['js-decision', 'a1', 'Continue?', 'diamond', '[100,320,260,120]'],
 ]) {
-  elements.set(id, new Y.Map(Object.entries({ type: 'shape', index, seed: 1, text: new Y.Text(text),
+  elements.set(id, new Y.Map(Object.entries({ id, type: 'shape', index, seed: 1, text: new Y.Text(text),
     shapeType, xywh, radius: 0, filled: true, fillColor: { light: '#eef2ff', dark: '#1e293b' },
     strokeColor: { light: '#475569', dark: '#94a3b8' }, strokeWidth: 2, strokeStyle: 'solid',
     shapeStyle: 'General', color: { light: '#172554', dark: '#e2e8f0' },
@@ -30,7 +30,7 @@ for (const [id, index, text, shapeType, xywh] of [
     rotate: 0, padding: [10, 20], maxWidth: false,
   })));
 }
-elements.set('js-arrow', new Y.Map(Object.entries({ type: 'connector', index: 'a2', seed: 1,
+elements.set('js-arrow', new Y.Map(Object.entries({ id: 'js-arrow', type: 'connector', index: 'a2', seed: 1,
   source: { id: 'js-start', position: [0.5, 1] }, target: { id: 'js-decision', position: [0.5, 0] },
   mode: 1, stroke: '#475569', strokeWidth: 2, strokeStyle: 'solid', rough: false,
   frontEndpointStyle: 'None', rearEndpointStyle: 'Arrow', text: new Y.Text('Next step'),

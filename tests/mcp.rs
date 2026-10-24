@@ -26,6 +26,9 @@ struct Client {
     responses: Receiver<Value>,
     id: u64,
 }
+// The running-app guard is deliberately process-global, including the fake app
+// spawned by the legacy journey. Serialize these tests so it cannot block peers.
+static APP_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl Client {
     fn start(data_dir: &std::path::Path, writes: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_affine-local-mcp"));
@@ -106,7 +109,196 @@ impl Drop for Client {
 }
 
 #[test]
+fn plain_text_create_retry_reports_persisted_canvas_diagnostics() {
+    use yrs::{Map, Out, ReadTxn, Transact};
+
+    let _guard = APP_GUARD_TEST_LOCK.lock().unwrap();
+    let (_dir, storage) = fixture();
+    let mut client = Client::start(&storage.data_dir, true);
+    let args = json!({"workspaceId":WORKSPACE,"documentId":"blank-retry","title":"Blank retry","content":"","mode":"edgeless"});
+    let created = client.success("affine_create_document", args.clone());
+    assert_eq!(created["alreadyExists"], false);
+    assert_eq!(created["elementCount"], 0);
+    assert_eq!(created["geometryBounds"], Value::Null);
+    assert_eq!(created["validation"]["idIntegrityValid"], true);
+    let read_args = json!({"workspaceId":WORKSPACE,"documentId":"blank-retry"});
+    let initial = client.success("affine_read_canvas", read_args.clone());
+    for key in [
+        "elementCount",
+        "canvasBlockCount",
+        "geometryBounds",
+        "validation",
+    ] {
+        assert_eq!(created[key], initial[key], "{key}");
+    }
+    client.success("affine_draw_pen", json!({"workspaceId":WORKSPACE,"documentId":"blank-retry","strokes":[{"id":"legacy-pen","points":[[100,200],[150,280]],"lineWidth":4}]}));
+    let db = Connection::open(db_path(&storage)).unwrap();
+    let legacy = document_journey::stored_doc(&db, "blank-retry");
+    let elements = affine_local_mcp::canvas::elements(&legacy).unwrap();
+    {
+        let mut txn = legacy.transact_mut();
+        let Some(Out::YMap(pen)) = elements.get(&txn, "legacy-pen") else {
+            panic!()
+        };
+        pen.remove(&mut txn, "id");
+    }
+    db.execute("DELETE FROM updates WHERE doc_id='blank-retry'", [])
+        .unwrap();
+    db.execute(
+        "INSERT OR REPLACE INTO snapshots(doc_id,data,updated_at) VALUES (?1,?2,?3)",
+        rusqlite::params![
+            "blank-retry",
+            legacy
+                .transact()
+                .encode_state_as_update_v1(&Default::default()),
+            "2026-01-01 00:00:00.000"
+        ],
+    )
+    .unwrap();
+    let saved = client.success("affine_read_canvas", read_args.clone());
+    assert_eq!(saved["elementCount"], 1);
+    assert!(saved["geometryBounds"].is_array());
+    assert_eq!(saved["validation"]["idIntegrityValid"], false);
+    assert_eq!(
+        saved["validation"]["issues"][0]["code"],
+        "missing-element-id"
+    );
+    let before = document_journey::database_state(&db);
+    let retried = client.success("affine_create_document", args);
+    assert_eq!(retried["alreadyExists"], true);
+    for key in [
+        "elementCount",
+        "canvasBlockCount",
+        "geometryBounds",
+        "validation",
+    ] {
+        assert_eq!(retried[key], saved[key], "{key}");
+    }
+    assert_eq!(document_journey::database_state(&db), before);
+    assert_eq!(client.success("affine_read_canvas", read_args), saved);
+}
+
+#[test]
+fn one_call_canvas_creation_is_atomic_retryable_and_has_compact_diagnostics() {
+    let _guard = APP_GUARD_TEST_LOCK.lock().unwrap();
+    let (_dir, storage) = fixture();
+    let mut client = Client::start(&storage.data_dir, true);
+    let args = json!({"workspaceId":WORKSPACE,"documentId":"one-call-drawing","title":"One-call drawing",
+        "strokes":[{"id":"outline","points":[[100,200],[400,200],[400,500]],"lineWidth":4}],
+        "nodes":[{"id":"label","text":"Elephant"}],
+        "frames":[{"id":"drawing-frame","title":"Drawing","bounds":[0,0,600,600],"childIds":["outline","label"]}]
+    });
+    let created = client.success("affine_create_canvas", args.clone());
+    assert_eq!(created["alreadyExists"], false);
+    assert_eq!(created["mode"], "edgeless");
+    assert_eq!(created["elementCount"], 2);
+    assert_eq!(created["validation"]["idIntegrityValid"], true);
+    assert_eq!(created["validation"]["uiVerified"], false);
+    assert_eq!(
+        std::fs::read_dir(storage.data_dir.join("mcp-backups"))
+            .unwrap()
+            .count(),
+        1,
+        "Creating the document and drawing must use one guarded write/backup"
+    );
+    assert_eq!(
+        client.success("affine_create_canvas", args.clone())["alreadyExists"],
+        true
+    );
+    let read_args = json!({"workspaceId":WORKSPACE,"documentId":"one-call-drawing"});
+    let full = client.success("affine_read_canvas", read_args.clone());
+    for element in full["elements"].as_array().unwrap() {
+        assert_eq!(element["properties"]["id"], element["id"]);
+    }
+    let mut summary_args = read_args.clone();
+    summary_args["summaryOnly"] = json!(true);
+    let summary = client.success("affine_read_canvas", summary_args);
+    assert!(summary.get("elements").is_none());
+    assert!(summary.get("blocks").is_none());
+    assert_eq!(summary["validation"], full["validation"]);
+    assert_eq!(summary["geometryBounds"], full["geometryBounds"]);
+    assert_eq!(summary["elementCount"], full["elementCount"]);
+    let mut conflict = args;
+    conflict["strokes"][0]["lineWidth"] = json!(12);
+    assert_eq!(
+        client.call("affine_create_canvas", conflict)["isError"],
+        true
+    );
+    assert_eq!(client.success("affine_read_canvas", read_args), full);
+    let db = Connection::open(db_path(&storage)).unwrap();
+    // Reproduce a pre-fix brush at the persistence boundary, then repair through
+    // actual MCP stdio without resending or replacing any geometry.
+    {
+        use yrs::{Map, Out, ReadTxn, Transact};
+        let legacy = document_journey::stored_doc(&db, "one-call-drawing");
+        let elements = affine_local_mcp::canvas::elements(&legacy).unwrap();
+        {
+            let mut txn = legacy.transact_mut();
+            let Some(Out::YMap(pen)) = elements.get(&txn, "outline") else {
+                panic!()
+            };
+            pen.remove(&mut txn, "id");
+        }
+        db.execute("DELETE FROM updates WHERE doc_id='one-call-drawing'", [])
+            .unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO snapshots(doc_id,data,updated_at) VALUES (?1,?2,?3)",
+            rusqlite::params![
+                "one-call-drawing",
+                legacy
+                    .transact()
+                    .encode_state_as_update_v1(&Default::default()),
+                "2026-01-01 00:00:00.000"
+            ],
+        )
+        .unwrap();
+    }
+    let read_args = json!({"workspaceId":WORKSPACE,"documentId":"one-call-drawing"});
+    assert_eq!(
+        client.success("affine_read_canvas", read_args.clone())["validation"]["idIntegrityValid"],
+        false
+    );
+    let before_repair = document_journey::database_state(&db);
+    db.execute_batch("CREATE TRIGGER fail_repair BEFORE INSERT ON updates WHEN NEW.doc_id='test-workspace' BEGIN SELECT RAISE(ABORT,'repair rollback'); END;").unwrap();
+    let repair_args =
+        json!({"workspaceId":WORKSPACE,"documentId":"one-call-drawing","repairMissingIds":true});
+    assert_eq!(
+        client.call("affine_edit_canvas", repair_args.clone())["isError"],
+        true
+    );
+    assert_eq!(document_journey::database_state(&db), before_repair);
+    db.execute_batch("DROP TRIGGER fail_repair").unwrap();
+    let repaired = client.success("affine_edit_canvas", repair_args.clone());
+    assert_eq!(repaired["repairedIds"], json!(["outline"]));
+    assert_eq!(repaired["validation"]["idIntegrityValid"], true);
+    assert_eq!(client.success("affine_read_canvas", read_args), full);
+    assert_eq!(
+        client.success("affine_edit_canvas", repair_args)["repairedIds"],
+        json!([])
+    );
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM updates", [], |r| r.get(0))
+        .unwrap();
+    let failed = client.call("affine_create_canvas", json!({"workspaceId":WORKSPACE,"documentId":"bad-drawing","title":"Rollback",
+        "strokes":[{"id":"pen","points":[[0,0],[10,10]]}],
+        "frames":[{"id":"frame","title":"Invalid membership","bounds":[0,0,600,600],"childIds":["missing"]}]}));
+    assert_eq!(failed["isError"], true);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM updates", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        count
+    );
+    assert_eq!(
+        client.success("affine_list_documents", json!({"workspaceId":WORKSPACE}))["total"],
+        2
+    );
+    let mut read_only = Client::start(&storage.data_dir, false);
+    assert_eq!(read_only.call("affine_create_canvas", json!({"workspaceId":WORKSPACE,"title":"Blocked","strokes":[{"id":"pen","points":[[0,0]]}]}))["isError"], true);
+}
+
+#[test]
 fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() {
+    let _guard = APP_GUARD_TEST_LOCK.lock().unwrap();
     let (_dir, storage) = fixture();
     let mut client = Client::start(&storage.data_dir, true);
     let tools = client.request("tools/list", json!({}));
@@ -120,6 +312,7 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
         "affine_search_documents",
         "affine_create_document",
         "affine_create_diagram",
+        "affine_create_canvas",
         "affine_read_canvas",
         "affine_edit_canvas",
         "affine_draw_pen",
@@ -156,6 +349,7 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
             "affine_create_workspace",
             "affine_delete_workspace",
             "affine_create_diagram",
+            "affine_create_canvas",
             "affine_edit_canvas",
             "affine_draw_pen",
             "affine_erase_canvas",
@@ -370,6 +564,11 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
         json!({"workspaceId":WORKSPACE,"title":"Blocked","content":"Must not persist"}),
     );
     let diagram_guarded = client.call("affine_create_diagram", json!({"workspaceId":WORKSPACE,"title":"Blocked diagram","nodes":[{"id":"x","text":"Must not persist"}]}));
+    let canvas_guarded = client.call("affine_create_canvas", json!({"workspaceId":WORKSPACE,"title":"Blocked drawing","strokes":[{"id":"pen","points":[[0,0],[10,10]]}]}));
+    let repair_guarded = client.call(
+        "affine_edit_canvas",
+        json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","repairMissingIds":true}),
+    );
     let edit_guarded = client.call("affine_edit_canvas", json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","nodes":[{"id":"start","text":"Must not persist"}]}));
     let pen_guarded = client.call("affine_draw_pen",json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","strokes":[{"id":"pen","points":[[0,0],[100,100]]}]}));
     let erase_guarded = client.call("affine_erase_canvas",json!({"workspaceId":WORKSPACE,"documentId":"native-diagram","strokeIds":["pen"],"confirm":true}));
@@ -411,6 +610,8 @@ fn actual_stdio_mcp_creation_read_search_retry_rollback_and_running_app_guard() 
     assert_eq!(diagram_guarded["isError"], true);
     assert_eq!(edit_guarded["isError"], true);
     for guarded in [
+        &canvas_guarded,
+        &repair_guarded,
         &pen_guarded,
         &erase_guarded,
         &media_guarded,

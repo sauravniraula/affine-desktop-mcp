@@ -46,7 +46,7 @@ const surface = block('js-surface', 'affine:surface', 5, ['js-frame', 'js-link',
 const wrapper = new Y.Map(); wrapper.set('type', '$blocksuite:internal:native$');
 wrapper.set('value', new Y.Map()); surface.set('prop:elements', wrapper);
 const elements = wrapper.get('value');
-function element(id, props) { const e = new Y.Map(); elements.set(id, e); for (const [key,value] of Object.entries(props)) e.set(key,value); }
+function element(id, props) { const e = new Y.Map(); e.set('id', id); elements.set(id, e); for (const [key,value] of Object.entries(props)) e.set(key,value); }
 element('js-pen', { type:'brush', index:'a0', seed:1, xywh:'[96,196,208,208]', rotate:0,
   points:[[4,4,0.2],[204,204,0.9]], lineWidth:8, color:{light:'#1e293b',dark:'#e2e8f0'} });
 element('js-curve', { type:'connector', index:'a1', seed:1, source:{position:[500,100]}, target:{position:[650,300]},

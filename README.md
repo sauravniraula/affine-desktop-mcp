@@ -189,7 +189,7 @@ npx --yes affine-desktop-mcp --check
 For a stdio MCP client, use `"command": "npx"` and
 `"args": ["--yes", "affine-desktop-mcp"]`. On Windows use `npx.cmd` if your
 client requires the command shim. For reproducibility, pin the package in args
-to a published version, for example `affine-desktop-mcp@0.3.0`. GUI clients may
+to a published version, for example `affine-desktop-mcp@0.4.0`. GUI clients may
 need the absolute path to `npx` or the installed launcher.
 
 ### pip / pipx / uvx
@@ -218,7 +218,7 @@ uvx affine-desktop-mcp --check
 
 Use the installed launcher's absolute path as your MCP client's `command`, with
 empty `args`, or use `"command": "uvx"`, `"args": ["affine-desktop-mcp"]`.
-Pin a published version with `affine-desktop-mcp==0.3.0` in uvx's args.
+Pin a published version with `affine-desktop-mcp==0.4.0` in uvx's args.
 `python -m affine_desktop_mcp` is also supported. Do not put diagnostic flags
 such as `--check` into the client's launch arguments. The configuration variables,
 allowlists and offline-write safety rules below apply to both launchers unchanged.
@@ -738,8 +738,9 @@ successful workspace listing and document read are the useful first checks.
 | `affine_list_folders` | `workspaceId`, optional `offset`/`limit`; native folder-tree nodes, parents, kinds, names/target IDs and sorting indexes |
 | `affine_manage_folder` | `workspaceId`, `action`, optional `nodeId`, `kind`, `name`, `targetId`, `parentId`, `index`, `confirm`; create/rename/move/reorder/delete folders and shortcuts |
 | `affine_create_diagram` | `workspaceId`, `title`, `nodes`, optional `edges`, `documentId`, `direction` (`TB` or `LR`); native shapes/connectors, not a note |
-| `affine_read_canvas` | `workspaceId`, `documentId`; native primitives in `elements`, native frame/link/media blocks in `blocks`, with IDs/properties |
-| `affine_edit_canvas` | `workspaceId`, `documentId`, optional `nodes`, `edges`, `strokes`, `curves`, `frames`, `links`, `media`, `deleteIds`, `confirmDelete`; atomic native-object upsert/delete |
+| `affine_create_canvas` | `workspaceId`, `title`, optional stable `documentId`, `nodes`, `edges`, `strokes`, `curves`, `frames`; create document and editable vector artwork in one atomic write |
+| `affine_read_canvas` | `workspaceId`, `documentId`, optional `summaryOnly`; counts, mode, ID diagnostics and geometry bounds; full reads also include native objects/properties |
+| `affine_edit_canvas` | `workspaceId`, `documentId`, optional `nodes`, `edges`, `strokes`, `curves`, `frames`, `links`, `media`, `deleteIds`, `confirmDelete`, `repairMissingIds`; atomic native-object upsert/delete/identity repair |
 | `affine_draw_pen` | `workspaceId`, `documentId`, `strokes`; create/replace editable native freehand strokes |
 | `affine_erase_canvas` | `workspaceId`, `documentId`, `strokeIds` and/or swept `path`, optional `radius`, required `confirm: true`; whole-stroke erasing |
 | `affine_import_media` | `workspaceId`, `documentId`, `media`; import local raster images or file attachments into the canvas and native blob store |
@@ -774,12 +775,79 @@ Quit AFFiNE, enable writes in your MCP client's configuration, and call:
 Call the same tool with a new ID and `"mode": "edgeless"`. Nonempty content creates
 an editable note positioned at `[100,100,800,300]`; empty content creates a blank
 canvas without a note. `primaryMode` is persisted in
-AFFiNE's `db$docProperties` document, so it opens in Edgeless mode. Content is
+AFFiNE's `db$docProperties` document as its default view. An already-open tab's
+`mode=page` URL can override that default: explicitly select **Edgeless** in the
+editor if needed. Content is
 **plain text inside a rich-text paragraph**, not parsed Markdown.
 
 Use a stable `documentId` for retries. Repeating the same ID/title/content/mode
 returns `alreadyExists: true`; a conflicting document is rejected, never
 replaced. Omitting the ID generates a new UUID on each successful invocation.
+
+### Create a drawing in one call
+
+Prefer **`affine_create_canvas`** for “create a document and draw an elephant.”
+It creates the Edgeless document, shapes, pen strokes, curves and frames together,
+using **one guarded transaction and one backup**, instead of creating a blank
+document and making a second write. Supply at least one object. Shapes support
+the same TB auto-layout as diagrams, unless explicitly positioned. Add media or
+link cards afterward with `affine_edit_canvas`. For example:
+
+```json
+{
+  "workspaceId": "<local-workspace-id>",
+  "documentId": "my-native-drawing",
+  "title": "Native drawing",
+  "strokes": [
+    {"id":"outline","points":[[100,100],[300,100],[350,200],[300,300],[100,300],[100,100]],"lineWidth":4}
+  ]
+}
+```
+
+Use a stable document ID: identical retries return `alreadyExists: true`, while
+different content or an existing modified canvas is rejected, never overwritten.
+Keep AFFiNE closed for all writes, then reopen **once** after the batch.
+
+### Canvas diagnostics and older drawings
+
+`affine_read_canvas` includes:
+
+- `mode`: persisted **primary** mode, not a live tab's selected view.
+- `validation.idIntegrityValid`: whether every primitive's internal `id` equals
+  its outer container key. This is **not full schema/render validation**.
+- `validation.issues`: specific missing/conflicting ID or invalid geometry issues.
+- `validation.uiVerified: false`: storage checks never prove that AFFiNE rendered.
+- `geometryBounds`: `[x,y,width,height]` for available shape/brush/canvas-block
+  bounds, accounting for rotation; `null` when none exist. Excludes notes and
+  connector routing, which AFFiNE computes; this is not an exact drawing extent.
+- `viewHint`: select Edgeless and use **Zoom to fit** if objects are not visible.
+
+Use `{"workspaceId":"...","documentId":"...","summaryOnly":true}` for checks
+without returning all objects and potentially thousands of pen points. Canvas
+creation/edit responses include the same persisted diagnostics, so an agent can
+inspect the result before requesting a full read. Check the actual editor before
+claiming visual success; do not treat `idIntegrityValid: true` as that proof.
+
+Older bridge versions omitted nested IDs on newly written primitives. AFFiNE
+0.27.4 initializes its models from that nested property, not the container key;
+the omission can prevent the entire Edgeless renderer from initializing. New
+writes always include the ID, including shapes, brushes and bound/free connectors.
+An ordinary upsert also restores an absent ID on the object being updated.
+
+To repair old drawings **without resending or replacing their geometry**, close
+AFFiNE and call `affine_edit_canvas`:
+
+```json
+{"workspaceId":"<local-workspace-id>","documentId":"<existing-document-id>","repairMissingIds":true}
+```
+
+This explicitly fills only **absent** internal IDs on existing shapes, brushes
+and connectors (up to 1000 per call). It preserves geometry, labels and unrelated
+objects, reports `repairedIds`, and still honors locks and grouped-canvas limits.
+It does **not** overwrite conflicting/non-string/null IDs or repair arbitrary
+schema corruption. Inspect remaining diagnostics; resolve conflicting identities
+manually. The operation is backed up, atomic and safe to retry. Reopen AFFiNE
+after the repair so it reconstructs its models, select Edgeless, then Zoom to fit.
 
 ### Create and delete workspaces
 

@@ -526,11 +526,23 @@ impl Storage {
             document,
             plain_text,
         } = prepared;
+        let with_summary = |mut result: Value, persisted: &Doc| -> Result<Value> {
+            if mode == "edgeless" {
+                result.as_object_mut().unwrap().extend(
+                    canvas::document_summary(persisted)?
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            Ok(result)
+        };
         self.write(workspace_id, |tx| {
         let root = load_doc(tx, workspace_id)?;
         let meta = documents::root_json(&root, "meta")?;
         if active_pages(&meta)?.iter().any(|page| page["id"] == id) {
-            let existing = active_document(tx, &meta, id)?;
+            let existing_document = load_doc(tx, id)?;
+            let existing = documents::render(&existing_document)?;
             let properties = optional_doc(tx, "db$docProperties")?;
             let content_matches = if let Some(content) = plain_text {
                 existing.markdown == if content.is_empty() {
@@ -539,7 +551,7 @@ impl Storage {
                     format!("# {title}\n\n{content}")
                 }
             } else {
-                documents::root_json(&load_doc(tx, id)?, "blocks")?
+                documents::root_json(&existing_document, "blocks")?
                     == documents::root_json(&document, "blocks")?
             };
             ensure!(
@@ -548,8 +560,9 @@ impl Storage {
                     && mode_for(properties.as_ref(), id)? == mode,
                 "documentId already exists with different content or mode; nothing was changed"
             );
-            return Ok(
+            return with_summary(
                 json!({"documentId": id, "workspaceId": workspace_id, "mode": mode, "alreadyExists": true}),
+                &existing_document,
             );
         }
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM snapshots WHERE doc_id=?1 UNION SELECT 1 FROM updates WHERE doc_id=?1)", [&id], |row| row.get(0))?;
@@ -595,13 +608,19 @@ impl Storage {
         append_update(tx, workspace_id, &root_update)?;
         // Independent readback before commit validates all dependent writes together.
         let saved_meta = registry(tx, workspace_id)?;
-        let saved = active_document(tx, &saved_meta, id)?;
         ensure!(
-            saved.title == title && documents::root_json(&load_doc(tx, id)?, "blocks")? == documents::root_json(&document, "blocks")?,
+            active_pages(&saved_meta)?.iter().any(|page| page["id"] == id),
+            "Document is not active in this workspace: {id}"
+        );
+        let saved_document = load_doc(tx, id)?;
+        let saved = documents::render(&saved_document)?;
+        ensure!(
+            saved.title == title && documents::root_json(&saved_document, "blocks")? == documents::root_json(&document, "blocks")?,
             "Created document readback failed"
         );
-        Ok(
+        with_summary(
             json!({"documentId": id, "workspaceId": workspace_id, "title": title, "mode": mode, "alreadyExists": false}),
+            &saved_document,
         )
         })
     }
@@ -673,16 +692,96 @@ impl Storage {
         )
     }
 
+    pub fn create_canvas(&self, params: &canvas::CreateCanvas) -> Result<Value> {
+        ensure!(
+            !params.title.trim().is_empty() && params.title.chars().count() <= 500,
+            "title must contain 1..500 characters"
+        );
+        let id = params
+            .document_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        ensure!(identifier(&id), "Invalid documentId");
+        let mut edit = canvas::EditCanvas {
+            workspace_id: params.workspace_id.clone(),
+            document_id: id.clone(),
+            nodes: params.nodes.clone(),
+            edges: params.edges.clone(),
+            strokes: params.strokes.clone(),
+            curves: params.curves.clone(),
+            frames: params.frames.clone(),
+            ..Default::default()
+        };
+        drawing::validate(&edit)?;
+        if !edit.nodes.is_empty() {
+            let bounds = canvas::layout(&edit.nodes, &edit.edges, canvas::Direction::Tb)?;
+            for (node, [x, y, w, h]) in edit.nodes.iter_mut().zip(bounds) {
+                node.position = Some([x, y]);
+                node.size = Some([w, h]);
+            }
+        }
+        let document = build_document(&id, params.title.trim(), "", "edgeless")?;
+        let applied = drawing::apply(&document, &edit, &[])?;
+        let mut result = self.save_new_document(
+            &params.workspace_id,
+            NewDocument {
+                id: &id,
+                title: params.title.trim(),
+                mode: "edgeless",
+                document,
+                plain_text: None,
+            },
+        )?;
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(applied.as_object().unwrap().clone());
+        Ok(result)
+    }
+
     pub fn read_canvas(&self, workspace_id: &str, document_id: &str) -> Result<Value> {
+        self.read_canvas_with_options(workspace_id, document_id, false)
+    }
+
+    pub fn read_canvas_with_options(
+        &self,
+        workspace_id: &str,
+        document_id: &str,
+        summary_only: bool,
+    ) -> Result<Value> {
         self.read(workspace_id, |db, meta| {
             active_document(db, meta, document_id)?;
             let document = load_doc(db, document_id)?;
             let elements = canvas::elements(&document)?;
             let raw = serde_json::to_value(elements.to_json(&document.transact()))?;
-            let mut elements: Vec<_> = raw.as_object().context("Invalid surface elements")?.iter().map(|(id, value)| json!({"id":id,"properties":value})).collect();
-            elements.sort_by_key(|value| (value["properties"]["index"].as_str().unwrap_or("").to_owned(), value["id"].as_str().unwrap().to_owned()));
             let blocks = drawing::canvas_blocks(&document)?;
-            Ok(json!({"workspaceId":workspace_id,"documentId":document_id,"elementCount":elements.len(),"elements":elements,"canvasBlockCount":blocks.len(),"blocks":blocks}))
+            let mut result = canvas::summary(&raw, &blocks)?;
+            result["workspaceId"] = json!(workspace_id);
+            result["documentId"] = json!(document_id);
+            result["mode"] = json!(mode_for(
+                optional_doc(db, "db$docProperties")?.as_ref(),
+                document_id
+            )?);
+            if !summary_only {
+                let mut elements: Vec<_> = raw
+                    .as_object()
+                    .context("Invalid surface elements")?
+                    .iter()
+                    .map(|(id, value)| json!({"id":id,"properties":value}))
+                    .collect();
+                elements.sort_by_key(|value| {
+                    (
+                        value["properties"]["index"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
+                        value["id"].as_str().unwrap().to_owned(),
+                    )
+                });
+                result["elements"] = json!(elements);
+                result["blocks"] = json!(blocks);
+            }
+            Ok(result)
         })
     }
 
@@ -771,10 +870,17 @@ impl Storage {
                 "Native canvas/block readback failed"
             );
             let raw = serde_json::to_value(canvas::elements(&saved)?.to_json(&saved.transact()))?;
+            let summary = canvas::summary(&raw, &drawing::canvas_blocks(&saved)?)?;
+            result
+                .as_object_mut()
+                .context("Invalid canvas result")?
+                .extend(summary.as_object().unwrap().clone());
             result["workspaceId"] = json!(workspace_id);
             result["documentId"] = json!(document_id);
-            result["elementCount"] = json!(raw.as_object().context("Invalid saved surface")?.len());
-            result["canvasBlockCount"] = json!(drawing::canvas_blocks(&saved)?.len());
+            result["mode"] = json!(mode_for(
+                optional_doc(db, "db$docProperties")?.as_ref(),
+                document_id
+            )?);
             Ok(result)
         })
     }

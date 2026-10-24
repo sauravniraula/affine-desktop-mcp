@@ -35,3 +35,8 @@ synthetic test data, not copies of personal AFFiNE documents.
 
 They verify that the Rust Yrs decoder reads independently produced Yjs data,
 including native surface wrappers, rich-text values and pending updates.
+Native shape/connector/brush fixtures include both the container key and nested
+`id` required by BlockSuite model initialization. Contract tests assert this;
+successful Yjs decoding alone does not prove that the AFFiNE editor can render.
+Legacy missing-ID cases are constructed explicitly in regression tests rather
+than being treated as valid native fixtures.

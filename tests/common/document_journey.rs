@@ -52,7 +52,7 @@ pub fn run(client: &mut Client, storage: &Storage) {
     let args = json!({"workspaceId":WORKSPACE,"documentId":"managed-page"});
     client.success("affine_create_document", json!({"workspaceId":WORKSPACE,"documentId":"managed-page","title":"Original 🌏","content":"Preserved management body","mode":"edgeless"}));
     let db = Connection::open(db_path(storage)).unwrap();
-    let original_canvas = client.success("affine_read_canvas", args.clone());
+    let mut original_canvas = client.success("affine_read_canvas", args.clone());
     let original = stored_doc(&db, "managed-page");
     let original_title_id = {
         let txn = original.transact();
@@ -88,6 +88,8 @@ pub fn run(client: &mut Client, storage: &Storage) {
         read["markdown"],
         "# Renamed 日本語 🌏\n\nPreserved management body"
     );
+    // Mode is now part of diagnostics; only the intended mode change may differ.
+    original_canvas["mode"] = json!("page");
     assert_eq!(
         client.success("affine_read_canvas", args.clone()),
         original_canvas
@@ -120,6 +122,7 @@ pub fn run(client: &mut Client, storage: &Storage) {
         "affine_update_document",
         json!({"workspaceId":WORKSPACE,"documentId":"managed-page","mode":"edgeless"}),
     );
+    original_canvas["mode"] = json!("edgeless");
     client.success(
         "affine_update_document",
         json!({"workspaceId":WORKSPACE,"documentId":"managed-page","title":"Final title"}),

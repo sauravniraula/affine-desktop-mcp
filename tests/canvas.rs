@@ -14,6 +14,78 @@ fn edge(value: Value) -> Edge {
 }
 
 #[test]
+fn every_native_primitive_persists_its_model_id_and_repairs_missing_ids_on_upsert() {
+    let doc = build_document("identity", "Identity", "", "edgeless").unwrap();
+    let elements = canvas::elements(&doc).unwrap();
+    for kind in ["brush", "shape", "connector"] {
+        canvas::upsert(&doc, &elements, kind, json!({"type":kind})).unwrap();
+        let map = {
+            let txn = doc.transact();
+            let Some(Out::YMap(map)) = elements.get(&txn, kind) else {
+                panic!()
+            };
+            assert_eq!(
+                map.get(&txn, "id").map(|v| v.to_string(&txn)),
+                Some(kind.to_owned()),
+                "AFFiNE initializes model.id from the nested property, not the container key"
+            );
+            map
+        };
+        map.remove(&mut doc.transact_mut(), "id");
+        canvas::upsert(&doc, &elements, kind, json!({"type":kind})).unwrap();
+        let txn = doc.transact();
+        assert_eq!(
+            map.get(&txn, "id").map(|v| v.to_string(&txn)),
+            Some(kind.to_owned())
+        );
+    }
+}
+
+#[test]
+fn upsert_rejects_conflicting_ids_without_mutating_the_element() {
+    let doc = build_document("identity", "Identity", "", "edgeless").unwrap();
+    let elements = canvas::elements(&doc).unwrap();
+    canvas::upsert(&doc, &elements, "pen", json!({"type":"brush"})).unwrap();
+    let before = elements.to_json(&doc.transact());
+    assert!(canvas::upsert(&doc, &elements, "pen", json!({"type":"brush","id":"other"})).is_err());
+    assert_eq!(elements.to_json(&doc.transact()), before);
+    let map = {
+        let txn = doc.transact();
+        let Some(Out::YMap(map)) = elements.get(&txn, "pen") else {
+            panic!()
+        };
+        map
+    };
+    map.insert(&mut doc.transact_mut(), "id", "other");
+    let before = elements.to_json(&doc.transact());
+    assert!(canvas::upsert(&doc, &elements, "pen", json!({"type":"brush"})).is_err());
+    assert_eq!(elements.to_json(&doc.transact()), before);
+}
+
+#[test]
+fn independent_canvas_fixtures_include_the_ids_required_by_blocksuite_models() {
+    for bytes in [
+        include_bytes!("fixtures/native-canvas.bin").as_slice(),
+        include_bytes!("fixtures/native-drawing.bin").as_slice(),
+    ] {
+        let doc = Doc::new();
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(bytes).unwrap())
+            .unwrap();
+        let map = canvas::elements(&doc).unwrap();
+        let txn = doc.transact();
+        for (id, value) in map.iter(&txn) {
+            let Out::YMap(element) = value else { panic!() };
+            assert_eq!(
+                element.get(&txn, "id").map(|v| v.to_string(&txn)),
+                Some(id.to_owned()),
+                "Invalid native fixture element: {id}"
+            );
+        }
+    }
+}
+
+#[test]
 fn reads_and_edits_independently_generated_javascript_native_shapes_and_connectors() {
     let doc = Doc::new();
     doc.transact_mut()
