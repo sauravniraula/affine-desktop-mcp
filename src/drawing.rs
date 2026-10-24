@@ -14,7 +14,7 @@ use yrs::{
     types::ToJson,
 };
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Stroke {
     pub id: String,
@@ -46,7 +46,7 @@ impl DrawPen {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Curve {
     pub id: String,
@@ -64,7 +64,7 @@ pub struct Curve {
     pub label_color: Option<Color>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Frame {
     pub id: String,
@@ -155,8 +155,8 @@ pub(crate) fn validate(p: &EditCanvas) -> Result<()> {
     ensure!(identifier(&p.document_id), "Invalid document ID");
     let upserted = ids(p);
     ensure!(
-        !upserted.is_empty() || !p.delete_ids.is_empty(),
-        "Supply objects to upsert or deleteIds"
+        !upserted.is_empty() || !p.delete_ids.is_empty() || p.repair_missing_ids,
+        "Supply objects to upsert, deleteIds or repairMissingIds=true"
     );
     ensure!(
         upserted.len() + p.delete_ids.len() <= 1000,
@@ -504,6 +504,27 @@ pub(crate) fn canvas_blocks(doc: &Doc) -> Result<Vec<Value>> {
 pub(crate) fn apply(doc: &Doc, p: &EditCanvas, prepared: &[media::Prepared]) -> Result<Value> {
     validate(p)?;
     let before = State::load(doc)?;
+    let repair_candidates: Vec<_> = if p.repair_missing_ids {
+        before
+            .elements
+            .iter()
+            .filter(|(id, v)| {
+                !p.delete_ids.contains(id)
+                    && v.get("id").is_none()
+                    && matches!(v["type"].as_str(), Some("shape" | "brush" | "connector"))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ensure!(
+        repair_candidates.len() <= 1000,
+        "At most 1000 missing IDs may be repaired per call"
+    );
+    for id in &repair_candidates {
+        before.editable(id)?;
+    }
     for id in ids(p) {
         before.editable(id)?;
     }
@@ -626,8 +647,18 @@ pub(crate) fn apply(doc: &Doc, p: &EditCanvas, prepared: &[media::Prepared]) -> 
     }
     State::load(doc)?.validate_frames()?;
     let deleted = delete(doc, &p.delete_ids)?;
+    let mut repaired_ids = Vec::new();
+    {
+        let mut txn = doc.transact_mut();
+        for id in repair_candidates {
+            if let Some(Out::YMap(map)) = elements.get(&txn, &id) {
+                map.insert(&mut txn, "id", id.as_str());
+                repaired_ids.push(id);
+            }
+        }
+    }
     Ok(
-        json!({"upsertedIds":ids(p),"deletedIds":deleted,"importedMedia":prepared.iter().map(media::Prepared::result).collect::<Vec<_>>()}),
+        json!({"upsertedIds":ids(p),"repairedIds":repaired_ids,"deletedIds":deleted,"importedMedia":prepared.iter().map(media::Prepared::result).collect::<Vec<_>>()}),
     )
 }
 
@@ -981,6 +1012,86 @@ fn segment_distance_squared(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_repair_reports_only_survivors_after_connector_cascade_deletion() {
+        let doc = crate::storage::build_document("repair-delete", "Repair delete", "", "edgeless")
+            .unwrap();
+        let setup: EditCanvas = serde_json::from_value(json!({
+            "workspaceId":"w", "documentId":"repair-delete",
+            "nodes":[{"id":"source","text":"Source","position":[0,0]},
+                     {"id":"target","text":"Target","position":[300,0]}],
+            "edges":[{"id":"incident","source":"source","target":"target"}],
+            "strokes":[{"id":"survivor","points":[[0,200],[100,200]]}]
+        }))
+        .unwrap();
+        apply(&doc, &setup, &[]).unwrap();
+        let elements = canvas::elements(&doc).unwrap();
+        {
+            let mut txn = doc.transact_mut();
+            for id in ["source", "incident", "survivor"] {
+                let Some(Out::YMap(map)) = elements.get(&txn, id) else {
+                    panic!()
+                };
+                map.remove(&mut txn, "id");
+            }
+        }
+        let edit: EditCanvas = serde_json::from_value(json!({
+            "workspaceId":"w", "documentId":"repair-delete",
+            "repairMissingIds":true, "deleteIds":["source"], "confirmDelete":true
+        }))
+        .unwrap();
+        let result = apply(&doc, &edit, &[]).unwrap();
+        assert_eq!(result["repairedIds"], json!(["survivor"]));
+        assert_eq!(result["deletedIds"], json!(["incident", "source"]));
+        let saved = State::load(&doc).unwrap();
+        assert!(!saved.elements.contains_key("source"));
+        assert!(!saved.elements.contains_key("incident"));
+        assert_eq!(saved.elements["survivor"]["id"], "survivor");
+        assert_eq!(saved.elements["target"]["id"], "target");
+        assert_eq!(apply(&doc, &edit, &[]).unwrap()["repairedIds"], json!([]));
+    }
+
+    #[test]
+    fn explicit_identity_repair_preserves_geometry_and_honors_locks() {
+        let doc = crate::storage::build_document("repair", "Repair", "", "edgeless").unwrap();
+        let elements = canvas::elements(&doc).unwrap();
+        canvas::upsert(
+            &doc,
+            &elements,
+            "pen",
+            json!({"type":"brush","xywh":"[0,0,10,10]","points":[[1,1],[9,9]],"lineWidth":2}),
+        )
+        .unwrap();
+        let pen = {
+            let txn = doc.transact();
+            let Some(Out::YMap(map)) = elements.get(&txn, "pen") else {
+                panic!()
+            };
+            map
+        };
+        pen.remove(&mut doc.transact_mut(), "id");
+        let repair: EditCanvas = serde_json::from_value(
+            json!({"workspaceId":"w","documentId":"repair","repairMissingIds":true}),
+        )
+        .unwrap();
+        let expected = {
+            let mut raw = State::load(&doc).unwrap().elements;
+            raw["pen"]["id"] = json!("pen");
+            raw
+        };
+        assert_eq!(
+            apply(&doc, &repair, &[]).unwrap()["repairedIds"],
+            json!(["pen"])
+        );
+        assert_eq!(State::load(&doc).unwrap().elements, expected);
+        assert_eq!(apply(&doc, &repair, &[]).unwrap()["repairedIds"], json!([]));
+        pen.remove(&mut doc.transact_mut(), "id");
+        pen.insert(&mut doc.transact_mut(), "lockedBySelf", true);
+        let before = State::load(&doc).unwrap().elements;
+        assert!(apply(&doc, &repair, &[]).is_err());
+        assert_eq!(State::load(&doc).unwrap().elements, before);
+    }
+
     #[test]
     fn nested_frame_locks_and_grouped_eraser_boundaries_are_respected() {
         use yrs::{Update, updates::decoder::Decode};

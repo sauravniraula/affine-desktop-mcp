@@ -213,6 +213,33 @@ pub struct EditCanvas {
     /// Must be true when deleteIds is nonempty.
     #[serde(default)]
     pub confirm_delete: bool,
+    /// Explicitly repair missing internal IDs on existing shapes, brushes and
+    /// connectors without replacing geometry. Conflicting IDs are never rewritten.
+    /// Element/ancestor locks and grouped-canvas restrictions still apply.
+    #[serde(default)]
+    pub repair_missing_ids: bool,
+}
+
+/// Create the document and its vector artwork in one atomic offline write.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateCanvas {
+    pub workspace_id: String,
+    pub title: String,
+    /// Stable ID for safe retries; a conflicting existing document is never overwritten.
+    pub document_id: Option<String>,
+    /// Optional shapes. Unpositioned shapes use TB auto-layout.
+    #[serde(default)]
+    pub nodes: Vec<Node>,
+    #[serde(default)]
+    pub edges: Vec<Edge>,
+    /// Editable pen strokes using absolute canvas points.
+    #[serde(default)]
+    pub strokes: Vec<crate::drawing::Stroke>,
+    #[serde(default)]
+    pub curves: Vec<crate::drawing::Curve>,
+    #[serde(default)]
+    pub frames: Vec<crate::drawing::Frame>,
 }
 
 pub fn validate(nodes: &[Node], edges: &[Edge]) -> Result<()> {
@@ -503,18 +530,33 @@ pub fn edge_props(edge: &Edge, source: [f64; 4], target: [f64; 4]) -> Value {
 /// Preserve each existing Y.Map and editable Y.Text, and never replace unrelated
 /// surface elements. Defaults apply only to supported properties in the payload.
 pub fn upsert(doc: &Doc, elements: &MapRef, id: &str, props: Value) -> Result<()> {
+    let props = props.as_object().context("Invalid element properties")?;
+    let kind = props
+        .get("type")
+        .and_then(Value::as_str)
+        .context("Missing element type")?;
+    ensure!(
+        !props.contains_key("id") || props["id"].as_str() == Some(id),
+        "Element properties.id must match its container key: {id}"
+    );
     let mut txn = doc.transact_mut();
     let map = match elements.get(&txn, id) {
         Some(Out::YMap(map)) => {
             ensure!(
                 map.get(&txn, "type")
-                    .is_some_and(|v| v.to_string(&txn) == props["type"].as_str().unwrap()),
+                    .is_some_and(|v| v.to_string(&txn) == kind),
                 "Element ID exists with a different type: {id}"
             );
             ensure!(
                 !map.get(&txn, "lockedBySelf")
                     .is_some_and(|v| v.to_string(&txn) == "true"),
                 "Element is locked: {id}"
+            );
+            ensure!(
+                map.get(&txn, "id").is_none_or(
+                    |v| matches!(v, Out::Any(yrs::Any::String(ref s)) if s.as_ref() == id)
+                ),
+                "Existing element has a conflicting internal ID: {id}"
             );
             map
         }
@@ -527,7 +569,10 @@ pub fn upsert(doc: &Doc, elements: &MapRef, id: &str, props: Value) -> Result<()
             map
         }
     };
-    for (key, value) in props.as_object().context("Invalid element properties")? {
+    // BlockSuite reads the model ID from this property, NOT the outer Y.Map key.
+    // Upserts also heal objects written by older bridge versions without an ID.
+    map.insert(&mut txn, "id", id);
+    for (key, value) in props {
         if key == "text" {
             let text = value.as_str().context("Invalid label")?;
             match map.get(&txn, key) {
@@ -584,4 +629,137 @@ pub fn bounds(value: &Value) -> Result<[f64; 4]> {
         "Invalid existing shape bounds"
     );
     Ok(bounds)
+}
+
+pub(crate) fn document_summary(doc: &Doc) -> Result<Value> {
+    use yrs::types::ToJson;
+    let raw = serde_json::to_value(elements(doc)?.to_json(&doc.transact()))?;
+    summary(&raw, &crate::drawing::canvas_blocks(doc)?)
+}
+
+/// Storage-level diagnostics, deliberately NOT a claim that the editor rendered.
+/// Geometry excludes connector routing (computed by AFFiNE) and note blocks.
+pub(crate) fn summary(raw: &Value, blocks: &[Value]) -> Result<Value> {
+    let elements = raw.as_object().context("Invalid surface elements")?;
+    let mut issues = Vec::new();
+    let grouped = elements.values().any(|props| props["type"] == "group");
+    for (id, props) in elements {
+        if props.get("id").is_none() {
+            let guidance = if grouped {
+                "Ungroup in AFFiNE first; automatic ID repair is unavailable on grouped canvases."
+            } else if matches!(
+                props["type"].as_str(),
+                Some("shape" | "brush" | "connector")
+            ) {
+                "Use affine_edit_canvas with repairMissingIds=true."
+            } else {
+                "Automatic ID repair is not supported for this primitive type; repair it in AFFiNE."
+            };
+            issues.push(json!({"code":"missing-element-id","elementId":id,
+                "message":format!("AFFiNE cannot initialize this model without properties.id. {guidance}")}));
+        } else if props["id"].as_str() != Some(id) {
+            issues.push(json!({"code":"conflicting-element-id","elementId":id,
+                "message":"properties.id differs from its container key; automatic repair will not overwrite a conflicting identity."}));
+        }
+    }
+    let id_integrity_valid = issues.is_empty();
+    let mut extent: Option<[f64; 4]> = None;
+    for (id, props, key, rotation_key) in elements
+        .iter()
+        .map(|(id, p)| (id.as_str(), p, "xywh", "rotate"))
+        .chain(blocks.iter().map(|b| {
+            (
+                b["id"].as_str().unwrap_or(""),
+                &b["properties"],
+                "prop:xywh",
+                "prop:rotate",
+            )
+        }))
+    {
+        let Some(value) = props.get(key) else {
+            continue;
+        };
+        let bound = value
+            .as_str()
+            .and_then(|s| serde_json::from_str::<[f64; 4]>(s).ok());
+        let rotation = props.get(rotation_key).map_or(Some(0.0), Value::as_f64);
+        let valid = bound.zip(rotation).filter(|(b, r)| {
+            b.iter().all(|n| n.is_finite()) && b[2] > 0.0 && b[3] > 0.0 && r.is_finite()
+        });
+        let Some(([x, y, w, h], rotation)) = valid else {
+            issues.push(json!({"code":"invalid-geometry","elementId":id,"message":"Invalid saved bounds or rotation."}));
+            continue;
+        };
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        let rw = w * cos.abs() + h * sin.abs();
+        let rh = w * sin.abs() + h * cos.abs();
+        let b = [
+            x + w / 2.0 - rw / 2.0,
+            y + h / 2.0 - rh / 2.0,
+            x + w / 2.0 + rw / 2.0,
+            y + h / 2.0 + rh / 2.0,
+        ];
+        extent = Some(match extent {
+            None => b,
+            Some(e) => [
+                e[0].min(b[0]),
+                e[1].min(b[1]),
+                e[2].max(b[2]),
+                e[3].max(b[3]),
+            ],
+        });
+    }
+    Ok(
+        json!({"elementCount":elements.len(),"canvasBlockCount":blocks.len(),
+        "geometryBounds":extent.map(|b| [b[0],b[1],b[2]-b[0],b[3]-b[1]]),
+        "validation":{"idIntegrityValid":id_integrity_valid,"uiVerified":false,"issues":issues},
+        "viewHint":"Open this document in Edgeless mode and use Zoom to fit. An existing tab URL may override primary mode. These are persisted-data checks, not visual verification; geometryBounds excludes connector routing and notes."}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_id_guidance_matches_supported_repairs_and_group_restrictions() {
+        for kind in ["shape", "brush", "connector", "text", "group"] {
+            let raw = json!({"missing":{"type":kind}});
+            let result = summary(&raw, &[]).unwrap();
+            let issue = &result["validation"]["issues"][0];
+            assert_eq!(issue["code"], "missing-element-id");
+            assert_eq!(issue["elementId"], "missing");
+            let message = issue["message"].as_str().unwrap();
+            assert!(message.contains("properties.id"));
+            match kind {
+                "shape" | "brush" | "connector" => {
+                    assert!(message.contains("affine_edit_canvas"));
+                    assert!(message.contains("repairMissingIds=true"));
+                }
+                "group" => {
+                    assert!(!message.contains("repairMissingIds=true"));
+                    assert!(message.contains("Ungroup in AFFiNE first"));
+                }
+                _ => {
+                    assert!(!message.contains("repairMissingIds=true"));
+                    assert!(message.contains("not supported for this primitive type"));
+                }
+            }
+        }
+        for kind in ["shape", "brush", "connector"] {
+            let result = summary(
+                &json!({
+                    "missing":{"type":kind}, "group":{"type":"group","id":"group"}
+                }),
+                &[],
+            )
+            .unwrap();
+            let issue = &result["validation"]["issues"][0];
+            assert_eq!(issue["code"], "missing-element-id");
+            assert_eq!(issue["elementId"], "missing");
+            let message = issue["message"].as_str().unwrap();
+            assert!(!message.contains("repairMissingIds=true"));
+            assert!(message.contains("Ungroup in AFFiNE first"));
+        }
+    }
 }
